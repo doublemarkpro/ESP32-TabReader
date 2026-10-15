@@ -1,0 +1,3 @@
+*.epub
+*.EPUB
+!README.md

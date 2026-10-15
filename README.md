@@ -1,11 +1,13 @@
-# ESP32 Han Dictionary · 小小助手
+# ESP32 TabReader · Tab5 阅读助手
 
 面向 **M5Stack Tab5（ESP32-P4，1280×720）** 的儿童学习终端固件。项目基于
 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)，在联网语音助手基础上加入查字、
-英语音标、课程表、作业计时、闹钟、天气、翻页时钟、儿童对话、设置与 MQTT 留言板，
+英语音标、课程表、作业计时、EPUB 阅读、天气、翻页时钟、儿童对话、设置与 MQTT 留言板，
 并为全部主要页面提供统一的浅色/深色主题。
 
-> 当前产品变体是 `m5stack-tab5-han-dictionary`（ESP32-P4 Rev < 3）和
+> 第一阶段已用阅读入口替换闹钟，支持 TF 卡 EPUB、TTF 动态字体和阅读排版设置；完整范围和路线见
+> [阅读模块开发记录](docs/READER_DEVELOPMENT.md)。为兼容现有构建/OTA 流程，当前产品变体名仍是
+> `m5stack-tab5-han-dictionary`（ESP32-P4 Rev < 3）和
 > `m5stack-tab5-han-dictionary-p4x`（Rev >= 3）。其他上游开发板不会启用这套学习 UI。
 
 ## 界面预览
@@ -25,9 +27,9 @@ SD 卡和电池硬件，因此截图不能代替真机验收。
 | --- | --- |
 | ![课程表](docs/ui/gallery/timetable.png) | ![作业计时](docs/ui/gallery/timer.png) |
 
-| 闹钟 | 天气 |
+| EPUB 阅读（阶段 1） | 天气 |
 | --- | --- |
-| ![闹钟](docs/ui/gallery/alarm.png) | ![天气](docs/ui/gallery/weather.png) |
+| [实现状态、TF 卡结构与后续路线](docs/READER_DEVELOPMENT.md) | ![天气](docs/ui/gallery/weather.png) |
 
 | 设置 | 翻页时钟 |
 | --- | --- |
@@ -50,7 +52,7 @@ SD 卡和电池硬件，因此截图不能代替真机验收。
 - **课程表**：固定周一至周五、每天七节课，学科图标与统一卡片布局。
 - **作业计时**：语文/数学/英语独立计时，分钟与秒钟显示，工作日历史，30–99 分钟环形计划设置；
   状态及计划写入 NVS。
-- **闹钟**：单个闹钟、周一至周日重复、SD 铃声下拉选择、试听、停止本次响铃。
+- **EPUB 阅读**：TF 卡书架、container/OPF/spine 解析、正文分页、动态 TTF、字号/行距/边距与日夜模式。
 - **天气**：青岛城市插画、实时天气、四日预报、空气质量、降水、日出日落与生活指数；
   生活指数支持完整内容弹窗和离线缓存。
 - **翻页时钟**：点击主页时间进入，显示时、分、秒、年月日、星期与农历，包含翻页动画。
@@ -58,7 +60,7 @@ SD 卡和电池硬件，因此截图不能代替真机验收。
   手动/定时深色模式；横向滑动进入 MQTT 留言板页。
 - **MQTT 留言板**：从 SD 卡 `mqtt.json` 读取 broker、端口、账号与订阅主题，显示最近留言；
   未配置时保持关闭，不在仓库中保存私人凭据。
-- **深色主题**：主页、字典、音标、课程表、作业、闹钟、天气、时钟和设置均有深色适配。
+- **深色主题**：主页、字典、音标、课程表、作业、阅读、天气、时钟和设置均有深色适配。
 
 ## 硬件与版本
 
@@ -143,7 +145,9 @@ python tools/content_pack.py validate dist/sdcard-starter/handict
 
 - `handict/qweather.json`：和风天气 API Host、Key 与地点；私有凭据不要提交。
 - `handict/mqtt.json`：留言板 broker 配置；仓库示例默认 `enabled: false`。
-- `handict/alarms/`：Ogg/Opus 闹钟铃声和 `catalog.json`。
+- `handict/books/`：用户自行放入的无 DRM EPUB 书籍（默认被 Git 忽略）。
+- `handict/fonts/`：阅读器按需加载的 TTF 字体（默认被 Git 忽略）。
+- `handict/alarms/`：旧闹钟资源，阅读模块稳定并完成迁移后清理。
 - `handict/phonetics/`：音标示范、例词音频与卡片。
 - `handict/ui/graphics/`：天气、设置、音标、MQTT 等大图资源。
 - `handict/dictionary/`：示例字条、索引和笔顺帧。
@@ -178,8 +182,8 @@ README 截图时才需要 `tools/ui-assets/`。`tools/ui-assets/readme-gallery.c
   不包含受版权保护的纸书正文、页码数据库或扫描页。
 - 中文任意字形、全量词条和全部笔顺尚未内置；未知内容需要合法数据源或联网服务。
 - 天气依赖和风天气服务与用户自己的 API 凭据；无网络时只显示最近一次有效缓存。
-- 语音对话依赖所配置的小智服务器；离线状态仍可使用本地页面、计时、闹钟和已有 SD 内容。
-- 当前仅支持一个软件闹钟。关屏不会进入深度睡眠；尚未把下一次闹钟写入 RX8130 进行 RTC 唤醒。
+- 语音对话依赖所配置的小智服务器；离线状态仍可使用本地页面、计时、阅读和已有 SD 内容。
+- 阅读阶段 1 使用纯文本和近似分页；CSS、图片、目录、精确分页、进度恢复和涟漪翻页仍按开发路线推进。
 - MQTT 留言板是轻量订阅客户端，不是 broker，也不替代 Mosquitto 的账号、ACL、TLS 与公网安全配置。
 - USB MSC、SD 热拔插、长时间断网恢复、不同 Tab5 硬件修订版和整日续航仍需真机专项验证。
 - 模拟器截图验证布局与交互结构，不验证扬声器、麦克风、触摸精度、电池或网络时序。

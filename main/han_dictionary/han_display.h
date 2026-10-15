@@ -1,5 +1,6 @@
 #pragma once
 #include "content_store.h"
+#include "reader/epub_reader.h"
 #ifdef HAN_UI_HOST_SIM
 #include "platform.h"
 #else
@@ -64,11 +65,12 @@ private:
         Phonetics,
         Timetable,
         Timer,
-        Alarm,
+        Reader,
         Weather,
         Network,
         Clock,
-        KeyboardLookup
+        KeyboardLookup,
+        Alarm  // Legacy page kept temporarily for settings migration; it has no launcher entry.
     };
     enum class ThemeMode {
         Light = 0,
@@ -126,6 +128,7 @@ private:
     void Phonetics();
     void Timetable();
     void Timer();
+    void Reader();
     void Alarm();
     void Weather();
     void Network();
@@ -147,6 +150,10 @@ private:
     void UnlockScreen();
     void UnlockScreenLocked();
     void SaveAutoLockSetting();
+    void SaveReaderPreferences();
+    void BuildReaderPages();
+    void EnsureReaderFont();
+    void ReleaseReaderFont();
     void ShowAppearancePopup();
     void UpdateAppearancePopup();
     void CloseAppearancePopup();
@@ -393,6 +400,28 @@ private:
     std::atomic<bool> alarm_ringing_{false};
     std::atomic<bool> alarm_previewing_{false};
     int alarm_ringtone_ = 0;
+    std::vector<han::reader::EpubBook> reader_books_;
+    std::vector<std::string> reader_fonts_;
+    han::reader::EpubBook reader_book_;
+    std::string reader_text_;
+    std::string reader_error_;
+    std::vector<size_t> reader_page_offsets_;
+    size_t reader_selected_book_ = 0;
+    size_t reader_spine_index_ = 0;
+    size_t reader_page_index_ = 0;
+    int reader_font_index_ = -1;
+    int reader_font_size_ = 32;
+    int reader_line_spacing_ = 10;
+    int reader_margin_ = 48;
+    bool reader_open_ = false;
+    bool reader_loading_ = false;
+    bool reader_scanned_ = false;
+    bool reader_dark_ = false;
+#ifndef HAN_UI_HOST_SIM
+    lv_font_t* reader_font_ = nullptr;
+    std::string reader_font_loaded_path_;
+    int reader_font_loaded_size_ = 0;
+#endif
     std::atomic<bool> local_audio_{false};
     int64_t last_checkpoint_ms_ = 0;
     han::TimetableData timetable_;

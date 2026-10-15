@@ -26,6 +26,7 @@ if(NOT EXISTS "${JSON_DIR}/cJSON.c")
 endif()
 add_executable(han_ui_sim main.cc "${ROOT}/main/han_dictionary/han_display.cc"
  "${ROOT}/main/han_dictionary/content_store.cc"
+ "${ROOT}/main/han_dictionary/reader/epub_reader.cc"
  "${ROOT}/main/han_dictionary/lunar_calendar.cc" "${JSON_DIR}/cJSON.c" ${UI_ASSETS})
 target_include_directories(han_ui_sim PRIVATE . "${ROOT}/main/han_dictionary" "${JSON_DIR}")
 target_compile_definitions(han_ui_sim PRIVATE HAN_UI_HOST_SIM=1 _CRT_SECURE_NO_WARNINGS HAN_SOURCE_ROOT="${ROOT}"

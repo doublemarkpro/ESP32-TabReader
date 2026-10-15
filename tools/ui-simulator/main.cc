@@ -225,6 +225,7 @@ int main(int argc, char** argv) {
         const bool keyboard_connect_smoke = std::getenv("HAN_UI_KEYBOARD_CONNECT_SMOKE") != nullptr;
         const bool settings_smoke = std::getenv("HAN_UI_SETTINGS_SMOKE") != nullptr;
         const bool boot_smoke = std::getenv("HAN_UI_BOOT_SMOKE") != nullptr;
+        const bool reader_smoke = std::getenv("HAN_UI_READER_SMOKE") != nullptr;
         const bool touch_pinyin_smoke = std::getenv("HAN_UI_TOUCH_PINYIN_SMOKE") != nullptr;
         const bool dictionary_first_frame_smoke =
             std::getenv("HAN_UI_DICTIONARY_FIRST_FRAME_SMOKE") != nullptr;
@@ -240,6 +241,32 @@ int main(int argc, char** argv) {
         }
         HanDisplay ui(nullptr, nullptr, 1280, 720, 0, 0, false, false, false);
         ui.SetupUI();
+        if (reader_smoke) {
+            Check(ui.OpenPage("reader"), "reader page opens");
+            Check(FindLabel(lv_screen_active(), "TF 卡书架") &&
+                      FindLabel(lv_screen_active(), "示例图书") &&
+                      FindLabel(lv_screen_active(), "模拟器示例"),
+                  "reader shelf shows EPUB metadata");
+            Shot(folder, "reader-shelf");
+            Click("示例图书");
+            const char* fixture =
+                "这是 EPUB 阅读页面的模拟内容。\n\n真机将从 TF 卡解压 "
+                "XHTML，并保留段落后进行分页。";
+            Check(
+                FindLabel(lv_screen_active(), fixture) && FindLabel(lv_screen_active(), "A+") &&
+                    FindLabel(lv_screen_active(), "行+") && FindLabel(lv_screen_active(), "边距") &&
+                    FindLabel(lv_screen_active(), "字体") && FindLabel(lv_screen_active(), "夜间"),
+                "reader exposes text and layout controls");
+            Click("A+");
+            Check(FindLabel(lv_screen_active(), fixture), "font-size change rebuilds the chapter");
+            Click("夜间");
+            Check(FindLabel(lv_screen_active(), "日间"), "reader toggles night mode");
+            Shot(folder, "reader-night");
+            Click("书架");
+            Check(FindLabel(lv_screen_active(), "TF 卡书架"), "reader returns to shelf");
+            std::cout << "PASS: reader shelf, chapter and live layout controls rendered.\n";
+            return 0;
+        }
         if (font_compare_smoke) {
             const char* font_path = std::getenv("HAN_UI_CANDIDATE_TTF");
             const char* preview_name = std::getenv("HAN_UI_FONT_PREVIEW_NAME");
@@ -581,7 +608,7 @@ int main(int argc, char** argv) {
             const std::string prefix = dark_smoke ? "dark-" : "";
             Shot(folder, (prefix + "home").c_str());
             const char* pages[] = {"dictionary", "phonetics", "timetable", "timer",
-                                   "alarm",      "weather",   "network",   "clock"};
+                                   "reader",     "weather",   "network",   "clock"};
             for (const auto* page : pages) {
                 Check(ui.OpenPage(page), "gallery page opens");
                 Shot(folder, (prefix + page).c_str());
@@ -670,7 +697,7 @@ int main(int argc, char** argv) {
         lv_tick_inc(2400);
         lv_timer_handler();
         Check(app.stops == stop_count + 1 && app.state == kDeviceStateIdle && dialog_scrim &&
-                   lv_obj_has_flag(dialog_scrim, LV_OBJ_FLAG_HIDDEN),
+                  lv_obj_has_flag(dialog_scrim, LV_OBJ_FLAG_HIDDEN),
               "dictionary handoff automatically ends the conversation and hides the modal");
         ui.SetStatus("正在聆听");
         ui.SetChatMessage("assistant", "这是一条迟到的回复");
@@ -740,9 +767,10 @@ int main(int argc, char** argv) {
         Check(lv_obj_get_style_text_font(FindLabel(lv_screen_active(), "英语音标"), LV_PART_MAIN) ==
                   &han_font_home,
               "home uses heavyweight rounded type");
-        const char* pages[] = {"查字典", "英语音标", "课程表", "作业计时", "闹钟", "天气"};
-        const char* files[] = {"dictionary", "phonetics", "timetable", "timer", "alarm", "weather"};
-        const char* page_titles[] = {"小小字典", "英语音标", "课程表", "作业计时", "闹钟", "天气"};
+        const char* pages[] = {"查字典", "英语音标", "课程表", "作业计时", "阅读", "天气"};
+        const char* files[] = {"dictionary", "phonetics", "timetable",
+                               "timer",      "reader",    "weather"};
+        const char* page_titles[] = {"小小字典", "英语音标", "课程表", "作业计时", "阅读", "天气"};
         for (int i = 0; i < 6; ++i) {
             Click(pages[i]);
             Shot(folder, files[i]);
@@ -1122,39 +1150,37 @@ int main(int argc, char** argv) {
                 Check(!FindLabel(lv_screen_active(), "生活指数完整建议"),
                       "lifestyle index popup closes");
             } else if (i == 4) {
-                Check(!FindLabel(lv_screen_active(), "设置提醒时间") &&
-                          !FindLabel(lv_screen_active(), "上学起床"),
-                      "alarm removes redundant time and purpose labels");
-                Check(!FindLabel(lv_screen_active(), "重复日期") &&
-                          FindLabel(lv_screen_active(), "周一") &&
-                          FindLabel(lv_screen_active(), "周日"),
-                      "alarm exposes all seven day choices without a redundant heading");
-                Check(FindLabel(lv_screen_active(), "保存并开启") &&
-                          FindLabel(lv_screen_active(), "关闭闹钟"),
-                      "alarm actions remain large and explicit");
-                auto ringtone_title = FindLabel(lv_screen_active(), "铃声");
-                auto ringtone_dropdown = FindDropdown(lv_screen_active());
-                auto preview_text = FindLabel(lv_screen_active(), "试听");
-                auto save_text = FindLabel(lv_screen_active(), "保存并开启");
-                auto disable_text = FindLabel(lv_screen_active(), "关闭闹钟");
-                Check(ringtone_title && ringtone_dropdown && preview_text && save_text &&
-                          disable_text &&
-                          lv_obj_get_style_text_font(ringtone_title, LV_PART_MAIN) ==
-                              lv_obj_get_style_text_font(ringtone_dropdown, LV_PART_MAIN) &&
-                          lv_obj_get_style_text_font(preview_text, LV_PART_MAIN) ==
-                              lv_obj_get_style_text_font(save_text, LV_PART_MAIN) &&
-                          lv_color_eq(lv_obj_get_style_bg_color(lv_obj_get_parent(preview_text),
-                                                                LV_PART_MAIN),
-                                      lv_color_hex(0x3a9df5)) &&
-                          lv_color_eq(lv_obj_get_style_bg_color(lv_obj_get_parent(disable_text),
-                                                                LV_PART_MAIN),
-                                      lv_color_hex(0xf05b78)),
-                      "alarm ringtone and actions use consistent bold high-contrast styling");
-                Click("保存并开启");
-                Check(FindLabel(lv_screen_active(), "闹钟已开启") &&
-                          FindLabel(lv_screen_active(), "✓"),
-                      "enabled alarm uses the checked status pill");
-                Shot(folder, "alarm-enabled");
+                const char* reader_fixture =
+                    "这是 EPUB 阅读页面的模拟内容。\n\n真机将从 TF 卡解压 "
+                    "XHTML，并保留段落后进行分页。";
+                Check(FindLabel(lv_screen_active(), "TF 卡书架") &&
+                          FindLabel(lv_screen_active(), "重新扫描") &&
+                          FindLabel(lv_screen_active(), "示例图书") &&
+                          FindLabel(lv_screen_active(), "模拟器示例") &&
+                          FindLabel(lv_screen_active(), "1 个章节"),
+                      "reader shelf shows EPUB metadata and rescan action");
+                Click("示例图书");
+                Check(FindLabel(lv_screen_active(), reader_fixture) &&
+                          FindLabel(lv_screen_active(), "书架") &&
+                          FindLabel(lv_screen_active(), "A-") &&
+                          FindLabel(lv_screen_active(), "A+") &&
+                          FindLabel(lv_screen_active(), "行-") &&
+                          FindLabel(lv_screen_active(), "行+") &&
+                          FindLabel(lv_screen_active(), "边距") &&
+                          FindLabel(lv_screen_active(), "字体") &&
+                          FindLabel(lv_screen_active(), "夜间"),
+                      "reader page exposes text and live layout controls");
+                Shot(folder, "reader-open");
+                Click("A+");
+                Check(FindLabel(lv_screen_active(), reader_fixture),
+                      "font-size change rebuilds the current chapter");
+                Click("夜间");
+                Check(FindLabel(lv_screen_active(), "日间"), "reader night mode toggles in place");
+                Shot(folder, "reader-night");
+                Click("书架");
+                Check(FindLabel(lv_screen_active(), "TF 卡书架") &&
+                          FindLabel(lv_screen_active(), "示例图书"),
+                      "reader returns to the shelf without leaving the module");
             }
             if (i == 2) {
                 Check(FindLabel(lv_screen_active(), "还没有课程，请导入课表"),

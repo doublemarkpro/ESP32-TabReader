@@ -1,7 +1,9 @@
 # An MCP-based Chatbot
 
-> **ESP32-HanDictionary / Tab5 学习助手**：从 [进度、TODO 与周末接续清单](TODO.md) 开始；
-> 包含已完成界面、资源迁移计划、NAS MQTT 留言板待办和换电脑构建步骤。以下保留小智上游介绍。
+> **ESP32-TabReader / Tab5 阅读助手**：阅读模块已开始替换原有闹钟入口，支持 EPUB package/spine
+> 解析、TF 卡 TTF 动态字体以及字号/行距/边距/日夜设置。当前范围、TF 卡目录、分阶段路线和换电脑
+> 接续方式见 [阅读模块开发记录](docs/READER_DEVELOPMENT.md)；移植取舍见
+> [CrossMux 评估](docs/Tab5-EPUB-CrossMux-porting-assessment.md)。以下保留小智上游介绍。
 
 （中文 | [English](README.md) | [日本語](README_ja.md)）
 
@@ -123,6 +125,8 @@
 
 ### 开发者文档
 
+- [Tab5 EPUB 阅读模块开发记录](docs/READER_DEVELOPMENT.md) - 当前实现、TF 卡结构、分阶段路线与跨电脑接续
+- [CrossMux 移植评估](docs/Tab5-EPUB-CrossMux-porting-assessment.md) - 架构取舍、资源预算与风险
 - [ESP-IDF 6.0 迁移文档](docs/esp-idf-6-migration.md) - SDK 兼容性、组件变更、旧版硬件支持和板卡验证状态
 - [自定义开发板指南](docs/custom-board_zh.md) - 学习如何为小智 AI 创建自定义开发板
 - [MCP 协议物联网控制用法说明](docs/mcp-usage_zh.md) - 了解如何通过 MCP 协议控制物联网设备
