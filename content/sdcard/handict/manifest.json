@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "pack_id": "handict-starter-1",
+  "dictionary": {
+    "complete": false,
+    "notice": "离线汉字学习资料；当前内置内容仅用于开发演示"
+  },
+  "phonetics": {"accent": "en-GB", "audio_included": false}
+}
