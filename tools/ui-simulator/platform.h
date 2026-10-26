@@ -181,6 +181,7 @@ struct WifiManager {
 };
 struct Settings {
     inline static std::map<std::string, int> values;
+    inline static std::map<std::string, std::string> strings;
     std::string ns;
     explicit Settings(std::string name, bool = false) : ns(name) {}
     int GetInt(std::string key, int fallback) {
@@ -189,6 +190,10 @@ struct Settings {
     }
     bool GetBool(std::string key, bool fallback) { return GetInt(key, fallback) != 0; }
     void SetInt(std::string key, int v) { values[ns + key] = v; }
+    std::string GetString(const std::string& key, const std::string& fallback = "") const {
+        auto it = strings.find(ns + key);
+        return it == strings.end() ? fallback : it->second;
+    }
     void SetBool(std::string key, bool v) { SetInt(key, v); }
 };
 namespace Lang::Sounds {

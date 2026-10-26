@@ -420,11 +420,13 @@ private:
     int reader_font_size_ = 32;
     int reader_line_spacing_ = 10;
     int reader_margin_ = 48;
+    int reader_background_index_ = 0;
     bool reader_open_ = false;
     bool reader_loading_ = false;
     bool reader_scanned_ = false;
     bool reader_dark_ = false;
     bool reader_font_picker_open_ = false;
+    bool reader_screen_settings_open_ = false;
     bool reader_controls_visible_ = false;
     bool reader_portrait_ = false;
     bool reader_display_portrait_ = false;

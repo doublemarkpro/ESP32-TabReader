@@ -184,6 +184,9 @@ constexpr uint32_t kDarkSurfaceRaised = 0x243650;
 constexpr uint32_t kDarkText = 0xf2f6fa;
 constexpr uint32_t kDarkMuted = 0xa9bad0;
 constexpr uint32_t kDarkBorder = 0x344b69;
+constexpr uint32_t kReaderBackgrounds[] = {0xfffdf7, 0xffffff, 0xe7efdf, 0xf5e6c8, 0xe2e8ee};
+constexpr const char* kReaderBackgroundNames[] = {"米白", "纸白", "浅绿", "暖黄", "灰蓝", "夜间"};
+constexpr int kReaderScreenTimeouts[] = {1, 3, 5, 10, 20, 30};
 std::atomic<bool> g_dark_theme_enabled{false};
 
 bool IsWakeWordPhoneticLabel(const char* text) {
@@ -2628,18 +2631,20 @@ void HanDisplay::SaveReaderPreferences() {
             ? reader_fonts_[font_index]
             : std::string{};
     const bool dark = reader_dark_;
+    const int background = reader_background_index_;
     const bool portrait = reader_portrait_;
     Application::GetInstance().Schedule(
-        [font_size, line_spacing, margin, font_index, font_path, dark, portrait] {
-        Settings settings("han_reader", true);
-        settings.SetInt("font_size", font_size);
-        settings.SetInt("line_space", line_spacing);
-        settings.SetInt("margin", margin);
-        settings.SetInt("font", font_index);
-        settings.SetString("font_path", font_path);
-        settings.SetBool("dark", dark);
-        settings.SetBool("portrait", portrait);
-    });
+        [font_size, line_spacing, margin, font_index, font_path, dark, background, portrait] {
+            Settings settings("han_reader", true);
+            settings.SetInt("font_size", font_size);
+            settings.SetInt("line_space", line_spacing);
+            settings.SetInt("margin", margin);
+            settings.SetInt("font", font_index);
+            settings.SetString("font_path", font_path);
+            settings.SetBool("dark", dark);
+            settings.SetInt("paper", background);
+            settings.SetBool("portrait", portrait);
+        });
 #endif
 }
 
@@ -2754,7 +2759,8 @@ void HanDisplay::Reader() {
 
     const int reader_width = reader_portrait_ ? 720 : 1280;
     const int reader_height = reader_portrait_ ? 1280 : 720;
-    const uint32_t page_background = reader_dark_ ? 0x101722 : 0xfffdf7;
+    const uint32_t page_background =
+        reader_dark_ ? 0x101722 : kReaderBackgrounds[reader_background_index_];
     const uint32_t page_text = reader_dark_ ? 0xf3f6fa : 0x263247;
     const uint32_t chrome_background = reader_dark_ ? 0x202c3d : 0xf4ecdf;
     const uint32_t chrome_text = reader_dark_ ? 0xf5f7fb : 0x263247;
@@ -2829,7 +2835,7 @@ void HanDisplay::Reader() {
     tap_zone(left_width, center_width, 1381);
     tap_zone(left_width + center_width, reader_width - left_width - center_width, 1382);
 
-    if (!reader_controls_visible_ && !reader_font_picker_open_)
+    if (!reader_controls_visible_ && !reader_font_picker_open_ && !reader_screen_settings_open_)
         return;
 
     const auto reader_button = [&](lv_obj_t* parent, const char* label, int x, int y, int width,
@@ -2859,15 +2865,17 @@ void HanDisplay::Reader() {
     lv_obj_set_style_bg_opa(top_controls, LV_OPA_90, 0);
     lv_obj_set_style_radius(top_controls, 0, 0);
     reader_button(top_controls, "书架", 16, 12, 104, reader_portrait_ ? 64 : 56, 1332);
-    auto book_title = Label(top_controls, reader_book_.title.c_str(), 136, 18,
-                            reader_portrait_ ? 400 : 850, reader_control_font);
+    auto book_title = Label(top_controls, reader_book_.title.c_str(), 136, 18, reader_width - 440,
+                            reader_control_font);
     lv_obj_set_height(book_title, 42);
     lv_label_set_long_mode(book_title, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(book_title, lv_color_hex(chrome_text), 0);
-    auto progress_label = Label(top_controls, progress.c_str(), reader_width - 150, 22, 132,
-                                reader_control_font);
+    auto progress_label =
+        Label(top_controls, progress.c_str(), reader_width - 280, 22, 132, reader_control_font);
     lv_obj_set_style_text_align(progress_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(progress_label, lv_color_hex(chrome_muted), 0);
+    reader_button(top_controls, "屏幕", reader_width - 136, 12, 120, reader_portrait_ ? 64 : 56,
+                  1390);
 
     const int bottom_height = reader_portrait_ ? 190 : 96;
     auto controls = Box(paper, 0, reader_height - bottom_height, reader_width, bottom_height,
@@ -2889,6 +2897,59 @@ void HanDisplay::Reader() {
             reader_button(controls, labels[index], 20 + index * 157, 15, 137, 66,
                           actions[index], index == 6 && reader_dark_);
         }
+    }
+
+    if (reader_screen_settings_open_) {
+        auto dim = Box(paper, 0, 0, reader_width, reader_height, 0x172033);
+        lv_obj_set_style_bg_opa(dim, LV_OPA_70, 0);
+        lv_obj_add_flag(dim, LV_OBJ_FLAG_CLICKABLE);
+        const int panel_width = reader_portrait_ ? reader_width - 48 : reader_width - 160;
+        const int panel_height = reader_portrait_ ? 660 : 500;
+        auto panel = Box(dim, (reader_width - panel_width) / 2, (reader_height - panel_height) / 2,
+                         panel_width, panel_height, chrome_background);
+        lv_obj_set_style_bg_color(panel, lv_color_hex(chrome_background), 0);
+        lv_obj_set_style_radius(panel, 24, 0);
+        lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+        const auto setting_label = [&](const char* value, int x, int y, int width) {
+            auto label = Label(panel, value, x, y, width, reader_control_font);
+            lv_obj_set_style_text_color(label, lv_color_hex(chrome_text), 0);
+            return label;
+        };
+        setting_label("阅读屏幕设置", 28, 24, panel_width - 200);
+        reader_button(panel, "关闭", panel_width - 148, 14, 120, 58, 1391);
+        setting_label("亮度", 28, 98, 100);
+        brightness_value_ = setting_label("", panel_width - 132, 98, 104);
+        lv_obj_set_style_text_align(brightness_value_, LV_TEXT_ALIGN_RIGHT, 0);
+        brightness_slider_ = lv_slider_create(panel);
+        lv_obj_set_pos(brightness_slider_, 140, 110);
+        lv_obj_set_size(brightness_slider_, panel_width - 304, 18);
+        lv_slider_set_range(brightness_slider_, 10, 100);
+        lv_slider_set_value(brightness_slider_, brightness_setting_, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(brightness_slider_, lv_color_hex(0x87958d), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(brightness_slider_, lv_color_hex(0x529379), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(brightness_slider_, lv_color_hex(0x529379), LV_PART_KNOB);
+        lv_obj_add_event_cb(brightness_slider_, OnSettingSliderChanged, LV_EVENT_VALUE_CHANGED,
+                            this);
+        lv_obj_add_event_cb(brightness_slider_, OnSettingSliderReleased, LV_EVENT_RELEASED, this);
+        setting_label("纸张背景", 28, 168, panel_width - 56);
+        const int columns = reader_portrait_ ? 3 : 6;
+        const int step = (panel_width - 56) / columns;
+        for (int index = 0; index < 6; ++index) {
+            const bool selected =
+                index == 5 ? reader_dark_ : !reader_dark_ && reader_background_index_ == index;
+            reader_button(panel, kReaderBackgroundNames[index], 28 + index % columns * step,
+                          216 + index / columns * 68, step - 12, 56, 1400 + index, selected);
+        }
+        const int timeout_y = reader_portrait_ ? 370 : 306;
+        setting_label("自动息屏（与系统共用）", 28, timeout_y, panel_width - 56);
+        for (int index = 0; index < 6; ++index) {
+            const std::string label = std::to_string(kReaderScreenTimeouts[index]) + " 分钟";
+            reader_button(panel, label.c_str(), 28 + index % columns * step,
+                          timeout_y + 48 + index / columns * 68, step - 12, 56, 1410 + index,
+                          auto_lock_minutes_ == kReaderScreenTimeouts[index]);
+        }
+        setting_label("亮度松手生效，设置自动保存", 28, panel_height - 48, panel_width - 56);
+        UpdateSettingLabels();
     }
 
     if (reader_font_picker_open_) {
@@ -6465,6 +6526,7 @@ void HanDisplay::Action(int a) {
         SaveReaderProgress(true);
         reader_open_ = false;
         reader_font_picker_open_ = false;
+        reader_screen_settings_open_ = false;
         reader_controls_visible_ = false;
         reader_loading_ = false;
         reader_error_.clear();
@@ -6515,19 +6577,44 @@ void HanDisplay::Action(int a) {
     }
     if (a == 1381) {
         reader_controls_visible_ = !reader_controls_visible_;
-        if (!reader_controls_visible_)
+        if (!reader_controls_visible_) {
             reader_font_picker_open_ = false;
+            reader_screen_settings_open_ = false;
+        }
         Render(Page::Reader);
         return;
     }
     if (a == 1346) {
         reader_controls_visible_ = true;
         reader_font_picker_open_ = true;
+        reader_screen_settings_open_ = false;
         Render(Page::Reader);
         return;
     }
     if (a == 1379) {
         reader_font_picker_open_ = false;
+        Render(Page::Reader);
+        return;
+    }
+    if (a == 1390 || a == 1391) {
+        reader_controls_visible_ = true;
+        reader_font_picker_open_ = false;
+        reader_screen_settings_open_ = a == 1390;
+        Render(Page::Reader);
+        return;
+    }
+    if (a >= 1400 && a <= 1405) {
+        reader_dark_ = a == 1405;
+        if (!reader_dark_)
+            reader_background_index_ = a - 1400;
+        SaveReaderPreferences();
+        Render(Page::Reader);
+        return;
+    }
+    if (a >= 1410 && a <= 1415) {
+        auto_lock_minutes_ = kReaderScreenTimeouts[a - 1410];
+        SaveAutoLockSetting();
+        lv_display_trigger_activity(display_);
         Render(Page::Reader);
         return;
     }
@@ -7507,6 +7594,7 @@ void HanDisplay::LoadPreferences() {
     reader_font_index_ = static_cast<int>(reader.GetInt("font", -1));
     reader_font_preference_ = reader.GetString("font_path");
     reader_dark_ = reader.GetBool("dark", false);
+    reader_background_index_ = std::clamp(static_cast<int>(reader.GetInt("paper", 0)), 0, 4);
     reader_portrait_ = reader.GetBool("portrait", false);
     Settings display("display");
     brightness_setting_ = std::clamp(static_cast<int>(display.GetInt("brightness", 75)), 10, 100);

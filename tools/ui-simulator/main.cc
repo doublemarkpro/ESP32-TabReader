@@ -19,9 +19,10 @@ DictionaryService& DictionaryService::GetInstance() {
 }
 static std::vector<uint8_t> pixels(1280 * 720 * 3);
 void Flush(lv_display_t* d, const lv_area_t* area, uint8_t* data) {
+    const int width = lv_display_get_horizontal_resolution(d);
     for (int y = area->y1; y <= area->y2; ++y)
         for (int x = area->x1; x <= area->x2; ++x) {
-            auto i = (y * 1280 + x) * 3;
+            auto i = (y * width + x) * 3;
             pixels[i] = data[2];
             pixels[i + 1] = data[1];
             pixels[i + 2] = data[0];
@@ -121,13 +122,31 @@ void Click(const char* label) {
     Check(obj != nullptr, label);
     lv_obj_send_event(lv_obj_get_parent(obj), LV_EVENT_CLICKED, nullptr);
 }
+lv_obj_t* FindAction(lv_obj_t* obj, int action) {
+    for (uint32_t i = 0; i < lv_obj_get_event_count(obj); ++i) {
+        auto event = lv_obj_get_event_dsc(obj, i);
+        if (reinterpret_cast<intptr_t>(lv_event_dsc_get_user_data(event)) == action)
+            return obj;
+    }
+    for (uint32_t i = 0; i < lv_obj_get_child_count(obj); ++i)
+        if (auto result = FindAction(lv_obj_get_child(obj, i), action))
+            return result;
+    return nullptr;
+}
+void ClickAction(int action) {
+    auto obj = FindAction(lv_screen_active(), action);
+    Check(obj != nullptr, "reader action exists");
+    lv_obj_send_event(obj, LV_EVENT_CLICKED, nullptr);
+}
 void Shot(const std::filesystem::path& folder, const char* name) {
     lv_refr_now(nullptr);
+    const int width = lv_display_get_horizontal_resolution(nullptr);
+    const int height = lv_display_get_vertical_resolution(nullptr);
     size_t title_ink = 0;
     size_t title_light = 0;
     for (int y = 20; y < 90; ++y)
         for (int x = 110; x < 600; ++x) {
-            const auto i = (y * 1280 + x) * 3;
+            const auto i = (y * width + x) * 3;
             if (pixels[i] < 60 && pixels[i + 1] < 80 && pixels[i + 2] < 120)
                 ++title_ink;
             if (pixels[i] > 205 && pixels[i + 1] > 205 && pixels[i + 2] > 205)
@@ -140,7 +159,7 @@ void Shot(const std::filesystem::path& folder, const char* name) {
     if (shot_name.find("dark-") == 0 && shot_name != "dark-clock" && shot_name.find("boot-") != 0)
         Check(title_light > 100, "dark screenshot must contain a visible light title");
     std::ofstream f(folder / (std::string(name) + ".ppm"), std::ios::binary);
-    f << "P6\n1280 720\n255\n";
+    f << "P6\n" << width << " " << height << "\n255\n";
     f.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
 }
 int main(int argc, char** argv) {
@@ -245,10 +264,12 @@ int main(int argc, char** argv) {
             Check(ui.OpenPage("reader"), "reader page opens");
             Check(FindLabel(lv_screen_active(), "TF 卡书架") &&
                       FindLabel(lv_screen_active(), "示例图书") &&
-                      FindLabel(lv_screen_active(), "模拟器示例"),
+                      FindLabel(lv_screen_active(), "作者：模拟器示例"),
                   "reader shelf shows EPUB metadata");
             Shot(folder, "reader-shelf");
             Click("示例图书");
+            Check(!FindLabel(lv_screen_active(), "A+"), "reading starts without menus");
+            ClickAction(1381);
             const char* fixture =
                 "这是 EPUB 阅读页面的模拟内容。\n\n真机将从 TF 卡解压 "
                 "XHTML，并保留段落后进行分页。";
@@ -259,9 +280,47 @@ int main(int argc, char** argv) {
                 "reader exposes text and layout controls");
             Click("A+");
             Check(FindLabel(lv_screen_active(), fixture), "font-size change rebuilds the chapter");
+            Click("屏幕");
+            Check(FindLabel(lv_screen_active(), "阅读屏幕设置") &&
+                      FindLabel(lv_screen_active(), "75%") &&
+                      FindLabel(lv_screen_active(), "30 分钟"),
+                  "screen panel has brightness and timeout controls");
+            auto settings_panel = lv_obj_get_parent(FindLabel(lv_screen_active(), "75%"));
+            lv_obj_t* brightness = nullptr;
+            for (uint32_t i = 0; i < lv_obj_get_child_count(settings_panel); ++i) {
+                auto child = lv_obj_get_child(settings_panel, i);
+                if (lv_obj_check_type(child, &lv_slider_class))
+                    brightness = child;
+            }
+            Check(brightness != nullptr, "reader brightness slider exists");
+            lv_slider_set_value(brightness, 35, LV_ANIM_OFF);
+            lv_obj_send_event(brightness, LV_EVENT_VALUE_CHANGED, nullptr);
+            lv_obj_send_event(brightness, LV_EVENT_RELEASED, nullptr);
+            Check(FindLabel(lv_screen_active(), "35%"), "brightness label follows slider value");
+            Click("浅绿");
+            auto paper = lv_obj_get_parent(FindLabel(lv_screen_active(), fixture));
+            Check(
+                lv_color_eq(lv_obj_get_style_bg_color(paper, LV_PART_MAIN), lv_color_hex(0xe7efdf)),
+                "paper background changes without losing reading text");
+            Click("20 分钟");
+            Click("关闭");
+            Check(!FindLabel(lv_screen_active(), "阅读屏幕设置"), "screen panel closes");
+            Click("屏幕");
+            Shot(folder, "reader-screen-settings");
+            Click("关闭");
             Click("夜间");
             Check(FindLabel(lv_screen_active(), "日间"), "reader toggles night mode");
             Shot(folder, "reader-night");
+            Click("屏幕");
+            Shot(folder, "reader-screen-settings-night");
+            Click("关闭");
+            Click("竖屏");
+            lv_display_set_resolution(display, 720, 1280);
+            Click("屏幕");
+            Shot(folder, "reader-screen-settings-portrait");
+            Click("关闭");
+            Click("横屏");
+            lv_display_set_resolution(display, 1280, 720);
             Click("书架");
             Check(FindLabel(lv_screen_active(), "TF 卡书架"), "reader returns to shelf");
             std::cout << "PASS: reader shelf, chapter and live layout controls rendered.\n";
