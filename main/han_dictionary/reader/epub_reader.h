@@ -14,6 +14,7 @@ struct EpubBook {
     std::string language;
     std::string package_path;
     std::string nav_path;
+    std::string cover_path;
     std::vector<std::string> spine;
     std::string error;
 
@@ -28,6 +29,9 @@ public:
     static bool ParsePackage(const std::string& path, EpubBook& book);
     static bool ReadSpineText(const EpubBook& book, size_t spine_index, std::string& text,
                               std::string& error);
+    static bool FindReadableSpineText(const EpubBook& book, size_t start_index, int direction,
+                                      size_t& actual_index, std::string& text,
+                                      std::string& error);
 };
 
 std::vector<EpubBook> ScanLibrary(const std::string& root, size_t max_books = 64);

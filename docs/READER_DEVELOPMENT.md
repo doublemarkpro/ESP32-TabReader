@@ -32,6 +32,14 @@ handict/
 
 字体必须有合法的个人使用或分发授权。大字体可能增加打开时间和 PSRAM 占用，建议先用包含所读语言字形的子集字体测试。EPUB 目前支持普通 ZIP 的 Store（0）和 Deflate（8）条目，不支持加密书籍、DRM 和 ZIP64。
 
+### 大体积中文字体的翻页性能
+
+Tab5 的 FreeType 阅读路径从 TF 卡流式读取字体，并启用 FATFS fast seek：打开只读文件时建立簇链索引，避免随机读取大字体时反复访问 FAT。阅读字体共享 1 MiB、1 KiB 块的四路组相联文件缓存；较小块可减少离散汉字轮廓的读放大。字形度量缓存为 8192 项，位图缓存根据字号限制在 256–2048 项（按约 2 MiB 预算估算）。缓存随 FreeType face 释放，切换字体或 USB MSC 时不会保留文件句柄。
+
+调试时同时观察 `Page 5: build=... refresh=... queued=...` 和 `Reader font I/O: ... SD blocks, ... RAM hits, ... ms SD`。分别测量首次打开、连续新页、返回已读页、字号切换和横竖屏切换；不能用已读页的缓存命中速度代替连续新页速度。该适配器使用当前 LVGL 9 的 FreeType face/cache 结构，升级 LVGL 时需复核该接口与流关闭顺序。
+
+2026-10-26，COM7 Tab5、8 MHz SDSPI、30 px `LXGWWenKaiGBScreen.ttf`，同一本中文 EPUB 的 spine 7 连续第 6–13 页实测总耗时为 1388、1116、802、574、632、401、358、450 ms；对应字体读卡耗时为 831、520、371、250、323、191、152、206 ms。第 13 页显示菜单为 379 ms。该数据覆盖连续新页；首次进入书架时字体创建、扫描和封面解码仍可能产生数秒加载，不能据此宣称所有页面操作都低于一秒。
+
 ## 代码结构
 
 - `main/han_dictionary/reader/epub_reader.{h,cc}`：书库/字体扫描、ZIP 条目读取、EPUB package/spine 解析、XHTML 纯文本化。

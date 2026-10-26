@@ -1,16 +1,23 @@
 #include "epub_reader.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string_view>
 
 #ifndef HAN_UI_HOST_SIM
-#include <esp_log.h>
 #include <dirent.h>
+#include <esp_heap_caps.h>
+#include <esp_log.h>
 #include <miniz.h>
+#include <sys/stat.h>
+
+#include "display/lvgl_display/jpg/jpeg_to_image.h"
 #endif
 
 namespace han::reader {
@@ -18,6 +25,7 @@ namespace {
 
 constexpr size_t kMaxPackageBytes = 1024 * 1024;
 constexpr size_t kMaxChapterBytes = 2 * 1024 * 1024;
+constexpr size_t kMaxCoverBytes = 4 * 1024 * 1024;
 constexpr size_t kMaxArchiveEntries = 4096;
 
 bool EndsWithCaseInsensitive(std::string_view value, std::string_view suffix) {
@@ -43,6 +51,12 @@ std::string Stem(const std::string& path) {
     if (dot != std::string::npos)
         name.resize(dot);
     return name;
+}
+
+std::string Lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
 }
 
 std::string DecodeEntities(std::string_view value) {
@@ -186,13 +200,24 @@ std::string CollapseWhitespace(std::string text) {
 std::string HtmlToText(std::string_view html) {
     std::string output;
     output.reserve(html.size());
-    bool hidden = false;
+    int hidden_depth = 0;
+    bool paragraph_indent_pending = false;
     for (size_t cursor = 0; cursor < html.size();) {
         if (html[cursor] != '<') {
             const auto tag = html.find('<', cursor);
-            if (!hidden)
-                output += DecodeEntities(html.substr(
+            if (hidden_depth == 0) {
+                const auto decoded = DecodeEntities(html.substr(
                     cursor, tag == std::string_view::npos ? std::string_view::npos : tag - cursor));
+                const bool has_visible_text =
+                    std::any_of(decoded.begin(), decoded.end(), [](unsigned char ch) {
+                        return ch >= 0x80 || !std::isspace(ch);
+                    });
+                if (paragraph_indent_pending && has_visible_text) {
+                    output += "　　";
+                    paragraph_indent_pending = false;
+                }
+                output += decoded;
+            }
             if (tag == std::string_view::npos)
                 break;
             cursor = tag;
@@ -213,11 +238,30 @@ std::string HtmlToText(std::string_view html) {
         std::string name(tag.substr(0, name_end));
         std::transform(name.begin(), name.end(), name.begin(),
                        [](unsigned char c) { return std::tolower(c); });
-        if (name == "script" || name == "style")
-            hidden = !closing;
-        if (!hidden && (name == "br" || name == "p" || name == "div" || name == "li" ||
-                        name == "h1" || name == "h2" || name == "h3" || name == "h4"))
-            output.push_back('\n');
+        const bool hidden_tag = name == "head" || name == "script" || name == "style";
+        if (hidden_tag) {
+            if (closing)
+                hidden_depth = std::max(0, hidden_depth - 1);
+            else if (tag.empty() || tag.back() != '/')
+                ++hidden_depth;
+            cursor = end + 1;
+            continue;
+        }
+        if (hidden_depth == 0) {
+            if (name == "p" && !closing) {
+                // Most Chinese EPUBs express first-line indentation in CSS, which this compact
+                // parser intentionally does not evaluate. Preserve the expected book typography
+                // by inserting two ideographic spaces before the first visible text. Deferring
+                // the insertion keeps image-only/empty paragraphs from becoming fake text pages.
+                output.push_back('\n');
+                paragraph_indent_pending = true;
+            } else if (name == "br" || name == "p" || name == "div" || name == "li" ||
+                       name == "h1" || name == "h2" || name == "h3" || name == "h4") {
+                output.push_back('\n');
+                if (name == "p")
+                    paragraph_indent_pending = false;
+            }
+        }
         cursor = end + 1;
     }
     return CollapseWhitespace(std::move(output));
@@ -274,9 +318,25 @@ public:
             }
             memcpy(output.data(), compressed.data(), compressed.size());
         } else if (entry.method == 8) {
-            const size_t written = tinfl_decompress_mem_to_mem(
-                output.data(), output.size(), compressed.data(), compressed.size(), 0);
-            if (written != output.size()) {
+            // tinfl_decompress_mem_to_mem() keeps its roughly 11 KiB decoder state on the
+            // caller's stack, which overflows the 8 KiB content-worker stack. EPUB parsing
+            // runs on that worker, so keep the decoder state on the heap instead.
+            auto decompressor = std::unique_ptr<tinfl_decompressor, decltype(&free)>(
+                static_cast<tinfl_decompressor*>(calloc(1, sizeof(tinfl_decompressor))), free);
+            if (!decompressor) {
+                output.clear();
+                return false;
+            }
+            tinfl_init(decompressor.get());
+            size_t input_bytes = compressed.size();
+            size_t output_bytes = output.size();
+            const auto status = tinfl_decompress(
+                decompressor.get(), compressed.data(), &input_bytes,
+                reinterpret_cast<uint8_t*>(output.data()),
+                reinterpret_cast<uint8_t*>(output.data()), &output_bytes,
+                TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+            if (status != TINFL_STATUS_DONE || input_bytes != compressed.size() ||
+                output_bytes != output.size()) {
                 output.clear();
                 return false;
             }
@@ -384,6 +444,121 @@ private:
     uint16_t entry_count_ = 0;
     bool open_ = false;
 };
+
+bool SaveCoverToCache(const std::string& book_path, const std::string& archive_path,
+                      const std::string& media_type, const std::string& data,
+                      std::string& output_path) {
+    const auto lower_path = Lowercase(archive_path);
+    const auto lower_type = Lowercase(media_type);
+    const bool jpeg = lower_type == "image/jpeg" || EndsWithCaseInsensitive(lower_path, ".jpg") ||
+                      EndsWithCaseInsensitive(lower_path, ".jpeg");
+    if (!jpeg || data.empty())
+        return false;
+
+    constexpr size_t kThumbnailWidth = 80;
+    constexpr size_t kThumbnailHeight = 120;
+    constexpr size_t kBmpHeaderSize = 54;
+    constexpr size_t kBmpRowSize = (kThumbnailWidth * 3 + 3) & ~size_t(3);
+    constexpr size_t kBmpSize = kBmpHeaderSize + kBmpRowSize * kThumbnailHeight;
+    mkdir("/sdcard/handict/cache", 0775);
+    mkdir("/sdcard/handict/cache/covers", 0775);
+    uint32_t hash = 2166136261u;
+    for (unsigned char ch : book_path + "\n" + archive_path) {
+        hash ^= ch;
+        hash *= 16777619u;
+    }
+    char file_name[96];
+    snprintf(file_name, sizeof(file_name), "/sdcard/handict/cache/covers/%08x.bmp",
+             static_cast<unsigned>(hash));
+    if (FILE* cached = fopen(file_name, "rb")) {
+        const bool seek_ok = fseek(cached, 0, SEEK_END) == 0;
+        const long cached_size = seek_ok ? ftell(cached) : -1;
+        const bool valid = cached_size == static_cast<long>(kBmpSize);
+        fclose(cached);
+        if (valid) {
+            output_path = file_name;
+            return true;
+        }
+    }
+
+    uint8_t* decoded = nullptr;
+    size_t decoded_size = 0;
+    size_t source_width = 0;
+    size_t source_height = 0;
+    size_t source_stride = 0;
+    if (jpeg_to_image(reinterpret_cast<const uint8_t*>(data.data()), data.size(), &decoded,
+                      &decoded_size, &source_width, &source_height, &source_stride) != ESP_OK ||
+        decoded == nullptr || source_width == 0 || source_height == 0) {
+        if (decoded != nullptr)
+            heap_caps_free(decoded);
+        return false;
+    }
+
+    std::vector<uint8_t> bmp(kBmpSize, 0);
+    std::fill(bmp.begin() + kBmpHeaderSize, bmp.end(), 0xff);
+    const auto put_u16 = [&bmp](size_t offset, uint16_t value) {
+        bmp[offset] = static_cast<uint8_t>(value);
+        bmp[offset + 1] = static_cast<uint8_t>(value >> 8);
+    };
+    const auto put_u32 = [&bmp](size_t offset, uint32_t value) {
+        bmp[offset] = static_cast<uint8_t>(value);
+        bmp[offset + 1] = static_cast<uint8_t>(value >> 8);
+        bmp[offset + 2] = static_cast<uint8_t>(value >> 16);
+        bmp[offset + 3] = static_cast<uint8_t>(value >> 24);
+    };
+    bmp[0] = 'B';
+    bmp[1] = 'M';
+    put_u32(2, static_cast<uint32_t>(bmp.size()));
+    put_u32(10, kBmpHeaderSize);
+    put_u32(14, 40);
+    put_u32(18, kThumbnailWidth);
+    put_u32(22, kThumbnailHeight);
+    put_u16(26, 1);
+    put_u16(28, 24);
+    put_u32(34, static_cast<uint32_t>(kBmpRowSize * kThumbnailHeight));
+
+    size_t draw_width = kThumbnailWidth;
+    size_t draw_height = std::max<size_t>(1, source_height * kThumbnailWidth / source_width);
+    if (draw_height > kThumbnailHeight) {
+        draw_height = kThumbnailHeight;
+        draw_width = std::max<size_t>(1, source_width * kThumbnailHeight / source_height);
+    }
+    const size_t offset_x = (kThumbnailWidth - draw_width) / 2;
+    const size_t offset_y = (kThumbnailHeight - draw_height) / 2;
+    for (size_t y = 0; y < draw_height; ++y) {
+        const size_t source_y = y * source_height / draw_height;
+        const size_t bmp_y = kThumbnailHeight - 1 - (offset_y + y);
+        for (size_t x = 0; x < draw_width; ++x) {
+            const size_t source_x = x * source_width / draw_width;
+            const size_t source_offset = source_y * source_stride + source_x * 2;
+            if (source_offset + 1 >= decoded_size)
+                continue;
+            const uint16_t pixel = static_cast<uint16_t>(decoded[source_offset]) |
+                                   (static_cast<uint16_t>(decoded[source_offset + 1]) << 8);
+            const uint8_t red = static_cast<uint8_t>(((pixel >> 11) & 0x1f) * 255 / 31);
+            const uint8_t green = static_cast<uint8_t>(((pixel >> 5) & 0x3f) * 255 / 63);
+            const uint8_t blue = static_cast<uint8_t>((pixel & 0x1f) * 255 / 31);
+            const size_t bmp_offset = kBmpHeaderSize + bmp_y * kBmpRowSize +
+                                      (offset_x + x) * 3;
+            bmp[bmp_offset] = blue;
+            bmp[bmp_offset + 1] = green;
+            bmp[bmp_offset + 2] = red;
+        }
+    }
+    heap_caps_free(decoded);
+
+    FILE* output = fopen(file_name, "wb");
+    if (!output)
+        return false;
+    const bool written = fwrite(bmp.data(), 1, bmp.size(), output) == bmp.size();
+    const bool closed = fclose(output) == 0;
+    if (!written || !closed) {
+        remove(file_name);
+        return false;
+    }
+    output_path = file_name;
+    return true;
+}
 #endif
 
 }  // namespace
@@ -410,7 +585,16 @@ bool EpubReader::ParsePackage(const std::string& path, EpubBook& book) {
         book.error = "缺少 META-INF/container.xml";
         return false;
     }
-    const auto rootfile = container.find("<rootfile");
+    size_t rootfile = 0;
+    while ((rootfile = container.find("<rootfile", rootfile)) != std::string::npos) {
+        const size_t name_end = rootfile + sizeof("<rootfile") - 1;
+        if (name_end >= container.size() ||
+            std::isspace(static_cast<unsigned char>(container[name_end])) ||
+            container[name_end] == '>' || container[name_end] == '/')
+            break;
+        // Do not confuse the enclosing <rootfiles> element with <rootfile>.
+        rootfile = name_end;
+    }
     const auto rootfile_end =
         rootfile == std::string::npos ? std::string::npos : container.find('>', rootfile);
     if (rootfile_end == std::string::npos ||
@@ -437,7 +621,24 @@ bool EpubReader::ParsePackage(const std::string& path, EpubBook& book) {
         book.author = TagText(package, "creator");
     book.language = TagText(package, "dc:language");
 
+    std::string cover_id;
+    size_t meta_cursor = 0;
+    while ((meta_cursor = package.find("<meta", meta_cursor)) != std::string::npos) {
+        const auto end = package.find('>', meta_cursor + 5);
+        if (end == std::string::npos)
+            break;
+        const auto tag = std::string_view(package).substr(meta_cursor, end - meta_cursor + 1);
+        if (Lowercase(Attribute(tag, "name")) == "cover") {
+            cover_id = Attribute(tag, "content");
+            break;
+        }
+        meta_cursor = end + 1;
+    }
+
     std::map<std::string, std::string> manifest;
+    std::string cover_archive_path;
+    std::string cover_media_type;
+    int cover_priority = 0;
     size_t cursor = 0;
     while ((cursor = package.find("<item", cursor)) != std::string::npos) {
         if (cursor + 5 < package.size() &&
@@ -452,12 +653,41 @@ bool EpubReader::ParsePackage(const std::string& path, EpubBook& book) {
         const auto tag = std::string_view(package).substr(cursor, end - cursor + 1);
         const auto id = Attribute(tag, "id");
         const auto href = Attribute(tag, "href");
-        if (!id.empty() && !href.empty())
-            manifest[id] = ResolvePath(book.package_path, href);
+        const auto resolved_path = ResolvePath(book.package_path, href);
+        if (!id.empty() && !resolved_path.empty())
+            manifest[id] = resolved_path;
         const auto properties = Attribute(tag, "properties");
         if (properties.find("nav") != std::string::npos)
-            book.nav_path = ResolvePath(book.package_path, href);
+            book.nav_path = resolved_path;
+        const auto media_type = Attribute(tag, "media-type");
+        if (!resolved_path.empty() && Lowercase(media_type).find("image/") == 0) {
+            const auto searchable = Lowercase(id + " " + href);
+            int priority = 0;
+            if (!cover_id.empty() && id == cover_id)
+                priority = 3;
+            else if (Lowercase(properties).find("cover-image") != std::string::npos)
+                priority = 2;
+            else if (searchable.find("cover") != std::string::npos)
+                priority = 1;
+            if (priority > cover_priority) {
+                cover_priority = priority;
+                cover_archive_path = resolved_path;
+                cover_media_type = media_type;
+            }
+        }
         cursor = end + 1;
+    }
+
+    if (!cover_archive_path.empty()) {
+        std::string cover_data;
+        if (archive.Read(cover_archive_path, kMaxCoverBytes, cover_data) &&
+            SaveCoverToCache(path, cover_archive_path, cover_media_type, cover_data,
+                             book.cover_path)) {
+            ESP_LOGI("EpubReader", "Cached cover %s -> %s", cover_archive_path.c_str(),
+                     book.cover_path.c_str());
+        } else {
+            ESP_LOGW("EpubReader", "Unable to cache cover %s", cover_archive_path.c_str());
+        }
     }
 
     cursor = 0;
@@ -509,6 +739,31 @@ bool EpubReader::ReadSpineText(const EpubBook& book, size_t spine_index, std::st
 #endif
 }
 
+bool EpubReader::FindReadableSpineText(const EpubBook& book, size_t start_index, int direction,
+                                       size_t& actual_index, std::string& text,
+                                       std::string& error) {
+    text.clear();
+    error.clear();
+    if (book.spine.empty() || start_index >= book.spine.size()) {
+        error = "章节索引越界";
+        return false;
+    }
+    const int step = direction < 0 ? -1 : 1;
+    for (int64_t index = static_cast<int64_t>(start_index);
+         index >= 0 && index < static_cast<int64_t>(book.spine.size()); index += step) {
+        std::string candidate;
+        std::string candidate_error;
+        if (ReadSpineText(book, static_cast<size_t>(index), candidate, candidate_error) &&
+            !candidate.empty()) {
+            actual_index = static_cast<size_t>(index);
+            text = std::move(candidate);
+            return true;
+        }
+    }
+    error = direction < 0 ? "前面没有可显示的正文" : "后面没有可显示的正文";
+    return false;
+}
+
 std::vector<EpubBook> ScanLibrary(const std::string& root, size_t max_books) {
     std::vector<EpubBook> books;
     books.reserve(std::min<size_t>(max_books, 64));
@@ -518,8 +773,12 @@ std::vector<EpubBook> ScanLibrary(const std::string& root, size_t max_books) {
     books.push_back(std::move(demo));
 #else
     DIR* directory = opendir(root.c_str());
-    if (!directory)
+    if (!directory) {
+        ESP_LOGW("EpubReader", "Unable to scan %s: errno=%d (%s)", root.c_str(), errno,
+                 std::strerror(errno));
         return books;
+    }
+    ESP_LOGI("EpubReader", "Scanning library %s", root.c_str());
     while (auto entry = readdir(directory)) {
         if (books.size() >= max_books)
             break;
@@ -527,10 +786,14 @@ std::vector<EpubBook> ScanLibrary(const std::string& root, size_t max_books) {
             continue;
         EpubBook book;
         const auto path = root + "/" + entry->d_name;
-        EpubReader::ParsePackage(path, book);
+        if (!EpubReader::ParsePackage(path, book)) {
+            ESP_LOGW("EpubReader", "Rejected %s: %s", path.c_str(), book.error.c_str());
+        }
         books.push_back(std::move(book));
     }
     closedir(directory);
+    ESP_LOGI("EpubReader", "Library scan complete: %u EPUB file(s)",
+             static_cast<unsigned>(books.size()));
 #endif
     std::sort(books.begin(), books.end(),
               [](const EpubBook& left, const EpubBook& right) { return left.title < right.title; });

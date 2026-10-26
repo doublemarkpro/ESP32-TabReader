@@ -9,6 +9,7 @@
 #include "display/lcd_display.h"
 #endif
 #include <atomic>
+#include <cstdint>
 #include <ctime>
 #include <functional>
 #include "study_timer.h"
@@ -151,9 +152,13 @@ private:
     void UnlockScreenLocked();
     void SaveAutoLockSetting();
     void SaveReaderPreferences();
-    void BuildReaderPages();
+    void BuildReaderPages(size_t preferred_offset = 0);
     void EnsureReaderFont();
     void ReleaseReaderFont();
+    void LoadReaderProgress(const std::string& path, size_t& spine, size_t& offset,
+                            uint16_t& progress) const;
+    void SaveReaderProgress(bool force);
+    void ApplyReaderOrientation(bool portrait);
     void ShowAppearancePopup();
     void UpdateAppearancePopup();
     void CloseAppearancePopup();
@@ -402,9 +407,11 @@ private:
     int alarm_ringtone_ = 0;
     std::vector<han::reader::EpubBook> reader_books_;
     std::vector<std::string> reader_fonts_;
+    std::vector<uint16_t> reader_book_progress_;
     han::reader::EpubBook reader_book_;
     std::string reader_text_;
     std::string reader_error_;
+    std::string reader_font_preference_;
     std::vector<size_t> reader_page_offsets_;
     size_t reader_selected_book_ = 0;
     size_t reader_spine_index_ = 0;
@@ -417,8 +424,17 @@ private:
     bool reader_loading_ = false;
     bool reader_scanned_ = false;
     bool reader_dark_ = false;
+    bool reader_font_picker_open_ = false;
+    bool reader_controls_visible_ = false;
+    bool reader_portrait_ = false;
+    bool reader_display_portrait_ = false;
+    int reader_pages_since_progress_save_ = 0;
 #ifndef HAN_UI_HOST_SIM
     lv_font_t* reader_font_ = nullptr;
+    lv_font_t* reader_ui_font_ = nullptr;
+    bool reader_font_uses_freetype_ = false;
+    uint8_t* reader_font_data_ = nullptr;
+    size_t reader_font_data_size_ = 0;
     std::string reader_font_loaded_path_;
     int reader_font_loaded_size_ = 0;
 #endif

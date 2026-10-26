@@ -1067,6 +1067,7 @@ set(MAIN_PRIV_REQUIRES_EXTRA "")
 if(CONFIG_BOARD_TYPE_M5STACK_CORE_TAB5 AND CONFIG_HAN_DICTIONARY)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA
         espressif__esp_tinyusb
+        espressif__freetype
     )
 endif()
 if(BOARD_TYPE STREQUAL "m5stack-stick-s3")
@@ -1120,6 +1121,16 @@ idf_component_register(SRCS ${SOURCES}
                         xiaozhi-fonts
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
+
+# LVGL compiles its FreeType adapter when CONFIG_LV_USE_FREETYPE is enabled,
+# but the upstream LVGL component does not declare the optional FreeType
+# component.  Add that edge from the project without modifying managed code.
+if(CONFIG_BOARD_TYPE_M5STACK_CORE_TAB5 AND CONFIG_HAN_DICTIONARY AND CONFIG_LV_USE_FREETYPE
+   AND NOT CMAKE_BUILD_EARLY_EXPANSION)
+    idf_component_get_property(LVGL_COMPONENT_LIB lvgl__lvgl COMPONENT_LIB)
+    target_link_libraries(${LVGL_COMPONENT_LIB} PRIVATE idf::espressif__freetype)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE idf::espressif__freetype)
+endif()
 
 # Use target_compile_definitions to define the reported board identity
 # If BOARD_NAME is empty, use BOARD_TYPE

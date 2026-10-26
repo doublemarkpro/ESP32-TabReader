@@ -6,6 +6,9 @@
 #include <esp_timer.h>
 #include <cbin_font.h>
 #include <src/misc/cache/lv_cache.h>
+#if LV_USE_FREETYPE
+#include <src/libs/freetype/lv_freetype_private.h>
+#endif
 #include <wifi_manager.h>
 #include "application.h"
 #include "assets/lang_config.h"
@@ -17,6 +20,7 @@
 #include <cJSON.h>
 #include <src/misc/cache/instance/lv_image_cache.h>
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +46,135 @@
 #include "qweather_service.h"
 
 namespace {
+#if !defined(HAN_UI_HOST_SIM) && LV_USE_FREETYPE
+// LVGL 9 shares a FreeType face between body/UI sizes. Keep this adapter here rather than
+// changing the managed LVGL/FreeType components. The face lock serializes stream access.
+struct ReaderFontStreamCache {
+    static constexpr size_t kBlockSize = 1024;
+    static constexpr size_t kWays = 4;
+    static constexpr size_t kSlots = 1024;
+    struct Block {
+        unsigned long offset = ULONG_MAX;
+        size_t size = 0;
+        uint64_t used = 0;
+    };
+    FT_StreamDesc descriptor;
+    FT_Stream_IoFunc read;
+    FT_Stream_CloseFunc close;
+    uint8_t* data = nullptr;
+    Block blocks[kSlots];
+    uint64_t tick = 0;
+    unsigned reads = 0;
+    unsigned hits = 0;
+    int64_t read_us = 0;
+
+    static unsigned long Read(FT_Stream stream, unsigned long offset, unsigned char* buffer,
+                              unsigned long count) {
+        if (count == 0)
+            return offset > stream->size ? 1 : 0;
+        if (offset >= stream->size || !buffer)
+            return 0;
+        auto cache = static_cast<ReaderFontStreamCache*>(stream->descriptor.pointer);
+        const size_t wanted = std::min(count, stream->size - offset);
+        size_t done = 0;
+        while (done < wanted) {
+            const unsigned long position = offset + done;
+            const unsigned long block_offset = position / kBlockSize * kBlockSize;
+            const size_t first = (block_offset / kBlockSize % (kSlots / kWays)) * kWays;
+            size_t slot = first;
+            bool hit = false;
+            for (size_t way = first; way < first + kWays; ++way) {
+                if (cache->blocks[way].offset == block_offset) {
+                    slot = way;
+                    hit = true;
+                    break;
+                }
+                if (cache->blocks[way].used < cache->blocks[slot].used)
+                    slot = way;
+            }
+            auto& block = cache->blocks[slot];
+            if (!hit) {
+                // The backing FILE position differs from FreeType's logical position after a
+                // cache hit/read-ahead. Force the original reader to seek on every miss.
+                FT_StreamRec backing = *stream;
+                backing.descriptor = cache->descriptor;
+                backing.pos = ULONG_MAX;
+                const int64_t started = esp_timer_get_time();
+                const size_t size =
+                    cache->read(&backing, block_offset, cache->data + slot * kBlockSize,
+                                std::min<unsigned long>(kBlockSize, stream->size - block_offset));
+                cache->read_us += esp_timer_get_time() - started;
+                ++cache->reads;
+                block.offset = block_offset;
+                block.size = size;
+            } else {
+                ++cache->hits;
+            }
+            block.used = ++cache->tick;
+            const size_t within = position - block_offset;
+            if (within >= block.size)
+                break;
+            const size_t size = std::min(wanted - done, block.size - within);
+            memcpy(buffer + done, cache->data + slot * kBlockSize + within, size);
+            done += size;
+        }
+        return done;
+    }
+
+    static void Close(FT_Stream stream) {
+        auto cache = static_cast<ReaderFontStreamCache*>(stream->descriptor.pointer);
+        stream->descriptor = cache->descriptor;
+        stream->read = cache->read;
+        stream->close = cache->close;
+        if (stream->close)
+            stream->close(stream);
+        heap_caps_free(cache->data);
+        delete cache;
+    }
+};
+
+ReaderFontStreamCache* ReaderStreamCache(const lv_font_t* font) {
+    if (!font)
+        return nullptr;
+    auto dsc = static_cast<const lv_freetype_font_dsc_t*>(font->dsc);
+    auto stream = dsc->cache_node->face->stream;
+    return stream->read == ReaderFontStreamCache::Read
+               ? static_cast<ReaderFontStreamCache*>(stream->descriptor.pointer)
+               : nullptr;
+}
+
+void AccelerateReaderFont(lv_font_t* font, int size) {
+    auto dsc = static_cast<const lv_freetype_font_dsc_t*>(font->dsc);
+    auto node = dsc->cache_node;
+    // A Chinese page can exceed the default 256 entries before it is even drawn. Keep
+    // metrics for several pages and bound bitmap storage to about 2 MiB at the selected size.
+    lv_cache_set_max_size(node->glyph_cache, 8192, nullptr);
+    const size_t bitmaps = std::clamp<size_t>(2 * 1024 * 1024 / (size * size + 128), 256, 2048);
+    lv_cache_set_max_size(node->draw_data_cache, bitmaps, nullptr);
+    auto stream = node->face->stream;
+    if (!stream->read || ReaderStreamCache(font))
+        return;
+    auto cache = new (std::nothrow) ReaderFontStreamCache;
+    if (!cache)
+        return;
+    cache->data = static_cast<uint8_t*>(
+        heap_caps_malloc(ReaderFontStreamCache::kSlots * ReaderFontStreamCache::kBlockSize,
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!cache->data) {
+        delete cache;
+        return;
+    }
+    cache->descriptor = stream->descriptor;
+    cache->read = stream->read;
+    cache->close = stream->close;
+    stream->descriptor.pointer = cache;
+    stream->read = ReaderFontStreamCache::Read;
+    stream->close = ReaderFontStreamCache::Close;
+    ESP_LOGI("HanDisplay", "Reader font cache: 1024 KiB in 1 KiB blocks, 8192 metrics, %u bitmaps",
+             static_cast<unsigned>(bitmaps));
+}
+#endif
+
 constexpr uint32_t kInk = 0x142b57, kBg = 0xfff9f0, kGreen = 0xd9f4df, kBlue = 0xd9edfc;
 constexpr uint32_t kPurple = 0xe9dffc, kOrange = 0xffe8d6, kPink = 0xffdfe3;
 constexpr uint32_t kMuted = 0x61708f, kCardBorder = 0xf1e8d9;
@@ -229,6 +362,32 @@ constexpr AlarmRingtone kAlarmRingtones[] = {
 };
 constexpr size_t kAlarmAudioLimit = 192 * 1024;
 constexpr int64_t kAlarmMaximumRingMs = 10 * 60 * 1000LL;
+
+std::string ReaderFontDisplayName(const std::string& path) {
+    const auto slash = path.find_last_of("/\\");
+    auto name = slash == std::string::npos ? path : path.substr(slash + 1);
+    const auto dot = name.find_last_of('.');
+    if (dot != std::string::npos)
+        name.resize(dot);
+    return name.empty() ? "未命名字体" : name;
+}
+
+uint32_t ReaderBookId(const std::string& path) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char ch : path) {
+        hash ^= ch;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+std::string ReaderProgressKey(char prefix, const std::string& path) {
+    char key[16];
+    snprintf(key, sizeof(key), "%c%08x", prefix,
+             static_cast<unsigned>(ReaderBookId(path)));
+    return key;
+}
+
 #if LV_USE_VECTOR_GRAPHIC
 struct GlyphBounds {
     float min_x = std::numeric_limits<float>::max();
@@ -894,7 +1053,9 @@ bool HanDisplay::InstallScalableDictionaryCandidateFont(const std::string& path)
 
     // Candidates only show eight glyphs at a time. A bounded dynamic cache keeps grayscale
     // antialiasing without reserving the roughly 29 MiB a complete 4 bpp CJK bitmap would need.
-    auto candidate = lv_tiny_ttf_create_file_ex(path.c_str(), 56, LV_FONT_KERNING_NONE, 48);
+    const std::string font_source = path.size() > 1 && path[1] == ':' ? path : "S:" + path;
+    auto candidate =
+        lv_tiny_ttf_create_file_ex(font_source.c_str(), 56, LV_FONT_KERNING_NONE, 48);
     if (candidate == nullptr) {
         ESP_LOGW("HanDisplay", "Ignoring invalid SD antialiased candidate font: %s", path.c_str());
         return false;
@@ -1873,6 +2034,14 @@ void HanDisplay::OnRefresh(lv_event_t* event) {
                      static_cast<unsigned>(self->flush_pixels_), self->flush_submit_us_,
                      self->flush_wait_us_,
                      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+#if LV_USE_FREETYPE
+            if (self->page_ == Page::Reader && self->reader_font_uses_freetype_) {
+                if (auto cache = ReaderStreamCache(self->reader_font_)) {
+                    ESP_LOGI("HanDisplay", "Reader font I/O: %u SD blocks, %u RAM hits, %lld ms SD",
+                             cache->reads, cache->hits, cache->read_us / 1000);
+                }
+            }
+#endif
             self->page_refresh_active_ = false;
             break;
         }
@@ -1885,6 +2054,15 @@ void HanDisplay::OnRefresh(lv_event_t* event) {
 void HanDisplay::Render(Page page) {
 #ifndef HAN_UI_HOST_SIM
     page_render_started_ms_ = NowMs();
+#if LV_USE_FREETYPE
+    if (page == Page::Reader && reader_font_uses_freetype_) {
+        if (auto cache = ReaderStreamCache(reader_font_)) {
+            cache->reads = 0;
+            cache->hits = 0;
+            cache->read_us = 0;
+        }
+    }
+#endif
 #endif
     theme_render_pending_ = false;
     const bool entering_dictionary = page == Page::Dictionary && page_ != Page::Dictionary;
@@ -1894,6 +2072,7 @@ void HanDisplay::Render(Page page) {
     flip_date_key_ = -1;
     flip_clock_initialized_ = false;
     page_ = page;
+    ApplyReaderOrientation(page == Page::Reader && reader_open_ && reader_portrait_);
     if (page == Page::Home) {
         assistant_navigation_pending_ = false;
         assistant_dialog_hide_at_ms_ = 0;
@@ -1978,7 +2157,25 @@ void HanDisplay::Render(Page page) {
     else
         lv_obj_remove_flag(body_, LV_OBJ_FLAG_CLICKABLE);
 
-    if (page == Page::Home) {
+    if (page == Page::Reader && reader_open_) {
+        // Reader owns the whole panel. The shared application chrome must stay hidden even when
+        // the reader's own transient top and bottom controls are visible.
+        lv_obj_add_flag(back_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(page_icon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(mascot_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(title_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(date_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(clock_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(top_divider_left_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(top_divider_right_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(wifi_button_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(battery_button_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(footer_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(assistant_card_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(body_, 0, 0);
+        lv_obj_set_size(body_, reader_portrait_ ? 720 : 1280,
+                        reader_portrait_ ? 1280 : 720);
+    } else if (page == Page::Home) {
         lv_obj_add_flag(back_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(page_icon_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(mascot_, LV_OBJ_FLAG_HIDDEN);
@@ -2185,7 +2382,7 @@ void HanDisplay::Home() {
     }
 }
 
-void HanDisplay::BuildReaderPages() {
+void HanDisplay::BuildReaderPages(size_t preferred_offset) {
     reader_page_offsets_.clear();
     reader_page_offsets_.push_back(0);
     reader_page_index_ = 0;
@@ -2195,8 +2392,12 @@ void HanDisplay::BuildReaderPages() {
     // This is the phase-1 paginator: it uses the selected font metrics as a conservative cell
     // estimate, then prefers paragraph boundaries. The next phase replaces this estimate with
     // glyph-by-glyph LVGL measurement while preserving these stable page offsets in the UI layer.
-    const size_t columns = std::max<size_t>(12, (1160 - 2 * reader_margin_) / reader_font_size_);
-    const size_t rows = std::max<size_t>(6, 430 / (reader_font_size_ + reader_line_spacing_));
+    const size_t page_width = reader_portrait_ ? 720 : 1280;
+    const size_t page_height = reader_portrait_ ? 1280 : 720;
+    const size_t columns = std::max<size_t>(10, (page_width - 2 * reader_margin_) /
+                                                   reader_font_size_);
+    const size_t rows = std::max<size_t>(8, (page_height - 48) /
+                                                (reader_font_size_ + reader_line_spacing_));
     const size_t characters_per_page = std::max<size_t>(80, columns * rows);
     size_t cursor = 0;
     while (cursor < reader_text_.size()) {
@@ -2219,6 +2420,10 @@ void HanDisplay::BuildReaderPages() {
         if (cursor < reader_text_.size())
             reader_page_offsets_.push_back(cursor);
     }
+    const auto page = std::upper_bound(reader_page_offsets_.begin(), reader_page_offsets_.end(),
+                                       std::min(preferred_offset, reader_text_.size()));
+    if (page != reader_page_offsets_.begin())
+        reader_page_index_ = static_cast<size_t>(page - reader_page_offsets_.begin() - 1);
 }
 
 void HanDisplay::EnsureReaderFont() {
@@ -2226,7 +2431,7 @@ void HanDisplay::EnsureReaderFont() {
     const std::string path =
         reader_font_index_ >= 0 && reader_font_index_ < static_cast<int>(reader_fonts_.size())
             ? reader_fonts_[reader_font_index_]
-            : std::string{};
+            : reader_font_preference_;
     if (path.empty()) {
         ReleaseReaderFont();
         return;
@@ -2235,27 +2440,181 @@ void HanDisplay::EnsureReaderFont() {
         reader_font_loaded_size_ == reader_font_size_)
         return;
     ReleaseReaderFont();
-    reader_font_ =
-        lv_tiny_ttf_create_file_ex(path.c_str(), reader_font_size_, LV_FONT_KERNING_NORMAL, 192);
+#if LV_USE_FREETYPE
+    // FreeType keeps the font on the SD card and reads only the tables/glyphs it needs. This is
+    // what lets a 26 MiB CJK font work without requiring a 26 MiB contiguous PSRAM allocation.
+    reader_font_ = lv_freetype_font_create(path.c_str(), LV_FREETYPE_FONT_RENDER_MODE_BITMAP,
+                                           reader_font_size_, LV_FREETYPE_FONT_STYLE_NORMAL);
+    reader_ui_font_ = lv_freetype_font_create(path.c_str(), LV_FREETYPE_FONT_RENDER_MODE_BITMAP,
+                                              24, LV_FREETYPE_FONT_STYLE_NORMAL);
     if (!reader_font_) {
+        if (reader_ui_font_)
+            lv_freetype_font_delete(reader_ui_font_);
+        reader_ui_font_ = nullptr;
+        ESP_LOGW("HanDisplay", "Unable to stream reader font with FreeType: %s", path.c_str());
+        return;
+    }
+    reader_font_uses_freetype_ = true;
+    AccelerateReaderFont(reader_font_, reader_font_size_);
+    reader_font_->fallback = const_cast<lv_font_t*>(DictionaryTextFont());
+    if (reader_ui_font_)
+        reader_ui_font_->fallback = const_cast<lv_font_t*>(DictionaryTextFont());
+    reader_font_loaded_path_ = path;
+    reader_font_loaded_size_ = reader_font_size_;
+    ESP_LOGI("HanDisplay", "Reader font opened with FreeType streaming: %s at %d px", path.c_str(),
+             reader_font_size_);
+#else
+    FILE* file = fopen(path.c_str(), "rb");
+    if (!file || fseek(file, 0, SEEK_END) != 0) {
+        if (file)
+            fclose(file);
         ESP_LOGW("HanDisplay", "Unable to open reader TTF: %s", path.c_str());
         reader_font_index_ = -1;
         return;
     }
+    const long file_size = ftell(file);
+    const size_t largest_psram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    constexpr size_t kReaderFontPsramReserve = 256 * 1024;
+    if (file_size <= 0 || fseek(file, 0, SEEK_SET) != 0 ||
+        static_cast<size_t>(file_size) + kReaderFontPsramReserve > largest_psram) {
+        fclose(file);
+        ESP_LOGW("HanDisplay", "Reader TTF is too large for PSRAM: %s (%ld bytes, largest=%u)",
+                 path.c_str(), file_size, static_cast<unsigned>(largest_psram));
+        reader_font_index_ = -1;
+        return;
+    }
+    reader_font_data_ = static_cast<uint8_t*>(
+        heap_caps_malloc(static_cast<size_t>(file_size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!reader_font_data_ ||
+        fread(reader_font_data_, 1, static_cast<size_t>(file_size), file) !=
+            static_cast<size_t>(file_size)) {
+        fclose(file);
+        if (reader_font_data_)
+            heap_caps_free(reader_font_data_);
+        reader_font_data_ = nullptr;
+        ESP_LOGW("HanDisplay", "Unable to cache reader TTF in PSRAM: %s", path.c_str());
+        reader_font_index_ = -1;
+        return;
+    }
+    fclose(file);
+    reader_font_data_size_ = static_cast<size_t>(file_size);
+    reader_font_ = lv_tiny_ttf_create_data_ex(reader_font_data_, reader_font_data_size_,
+                                              reader_font_size_, LV_FONT_KERNING_NORMAL, 192);
+    if (!reader_font_) {
+        heap_caps_free(reader_font_data_);
+        reader_font_data_ = nullptr;
+        reader_font_data_size_ = 0;
+        ESP_LOGW("HanDisplay", "Unable to parse reader TTF: %s", path.c_str());
+        reader_font_index_ = -1;
+        return;
+    }
     reader_font_->fallback = const_cast<lv_font_t*>(DictionaryTextFont());
+    reader_ui_font_ = lv_tiny_ttf_create_data_ex(reader_font_data_, reader_font_data_size_, 24,
+                                                 LV_FONT_KERNING_NORMAL, 96);
+    if (reader_ui_font_)
+        reader_ui_font_->fallback = const_cast<lv_font_t*>(DictionaryTextFont());
     reader_font_loaded_path_ = path;
     reader_font_loaded_size_ = reader_font_size_;
+    ESP_LOGI("HanDisplay", "Reader TTF cached in PSRAM: %s (%u bytes at %d px)", path.c_str(),
+             static_cast<unsigned>(reader_font_data_size_), reader_font_size_);
+#endif
 #endif
 }
 
 void HanDisplay::ReleaseReaderFont() {
 #ifndef HAN_UI_HOST_SIM
-    if (reader_font_)
-        lv_tiny_ttf_destroy(reader_font_);
+    if (reader_ui_font_) {
+#if LV_USE_FREETYPE
+        if (reader_font_uses_freetype_)
+            lv_freetype_font_delete(reader_ui_font_);
+        else
+#endif
+            lv_tiny_ttf_destroy(reader_ui_font_);
+    }
+    reader_ui_font_ = nullptr;
+    if (reader_font_) {
+#if LV_USE_FREETYPE
+        if (reader_font_uses_freetype_)
+            lv_freetype_font_delete(reader_font_);
+        else
+#endif
+            lv_tiny_ttf_destroy(reader_font_);
+    }
     reader_font_ = nullptr;
+    reader_font_uses_freetype_ = false;
+    if (reader_font_data_)
+        heap_caps_free(reader_font_data_);
+    reader_font_data_ = nullptr;
+    reader_font_data_size_ = 0;
     reader_font_loaded_path_.clear();
     reader_font_loaded_size_ = 0;
 #endif
+}
+
+void HanDisplay::LoadReaderProgress(const std::string& path, size_t& spine, size_t& offset,
+                                    uint16_t& progress) const {
+    spine = 0;
+    offset = 0;
+    progress = 0;
+#ifndef HAN_UI_HOST_SIM
+    Settings settings("han_reader");
+    spine = static_cast<size_t>(std::max<int32_t>(0, settings.GetInt(ReaderProgressKey('s', path))));
+    offset = static_cast<size_t>(std::max<int32_t>(0, settings.GetInt(ReaderProgressKey('o', path))));
+    progress = static_cast<uint16_t>(
+        std::clamp<int32_t>(settings.GetInt(ReaderProgressKey('p', path)), 0, 1000));
+#endif
+}
+
+void HanDisplay::SaveReaderProgress(bool force) {
+    if (!reader_open_ || reader_book_.path.empty() || reader_book_.spine.empty())
+        return;
+    const size_t offset = reader_page_offsets_.empty()
+                              ? 0
+                              : reader_page_offsets_[std::min(reader_page_index_,
+                                                              reader_page_offsets_.size() - 1)];
+    const uint32_t chapter_progress = reader_text_.empty()
+                                          ? 0
+                                          : static_cast<uint32_t>(
+                                                std::min<uint64_t>(1000, offset * 1000ULL /
+                                                                            reader_text_.size()));
+    const uint16_t progress = static_cast<uint16_t>(std::min<uint64_t>(
+        1000, (reader_spine_index_ * 1000ULL + chapter_progress) /
+                  reader_book_.spine.size()));
+    if (reader_selected_book_ < reader_book_progress_.size())
+        reader_book_progress_[reader_selected_book_] = progress;
+    if (!force && ++reader_pages_since_progress_save_ < 5)
+        return;
+    reader_pages_since_progress_save_ = 0;
+#ifndef HAN_UI_HOST_SIM
+    const std::string path = reader_book_.path;
+    const int32_t saved_spine = static_cast<int32_t>(reader_spine_index_);
+    const int32_t saved_offset = static_cast<int32_t>(
+        std::min<size_t>(offset, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
+    Application::GetInstance().Schedule([path, saved_spine, saved_offset, progress] {
+        Settings settings("han_reader", true);
+        settings.SetInt(ReaderProgressKey('s', path), saved_spine);
+        settings.SetInt(ReaderProgressKey('o', path), saved_offset);
+        settings.SetInt(ReaderProgressKey('p', path), progress);
+    });
+#endif
+}
+
+void HanDisplay::ApplyReaderOrientation(bool portrait) {
+    if (reader_display_portrait_ == portrait)
+        return;
+#ifndef HAN_UI_HOST_SIM
+    lv_display_set_rotation(display_,
+                            portrait ? LV_DISPLAY_ROTATION_0 : LV_DISPLAY_ROTATION_90);
+#endif
+    reader_display_portrait_ = portrait;
+    width_ = portrait ? 720 : 1280;
+    height_ = portrait ? 1280 : 720;
+#ifndef HAN_UI_HOST_SIM
+    ESP_LOGI("HanDisplay", "Reader orientation: %s (%dx%d)",
+             portrait ? "portrait" : "landscape", width_, height_);
+#endif
+    if (root_)
+        lv_obj_set_size(root_, width_, height_);
 }
 
 void HanDisplay::SaveReaderPreferences() {
@@ -2264,24 +2623,42 @@ void HanDisplay::SaveReaderPreferences() {
     const int line_spacing = reader_line_spacing_;
     const int margin = reader_margin_;
     const int font_index = reader_font_index_;
+    const std::string font_path =
+        font_index >= 0 && font_index < static_cast<int>(reader_fonts_.size())
+            ? reader_fonts_[font_index]
+            : std::string{};
     const bool dark = reader_dark_;
-    Application::GetInstance().Schedule([font_size, line_spacing, margin, font_index, dark] {
+    const bool portrait = reader_portrait_;
+    Application::GetInstance().Schedule(
+        [font_size, line_spacing, margin, font_index, font_path, dark, portrait] {
         Settings settings("han_reader", true);
         settings.SetInt("font_size", font_size);
         settings.SetInt("line_space", line_spacing);
         settings.SetInt("margin", margin);
         settings.SetInt("font", font_index);
+        settings.SetString("font_path", font_path);
         settings.SetBool("dark", dark);
+        settings.SetBool("portrait", portrait);
     });
 #endif
 }
 
 void HanDisplay::Reader() {
+    if (!reader_open_)
+        EnsureReaderFont();
+#ifndef HAN_UI_HOST_SIM
+    const lv_font_t* shelf_title_font = reader_font_ ? reader_font_ : DictionaryTextFont();
+    const lv_font_t* shelf_ui_font = reader_ui_font_ ? reader_ui_font_ : DictionaryTextFont();
+#else
+    const lv_font_t* shelf_title_font = DynamicTextFont();
+    const lv_font_t* shelf_ui_font = DynamicTextFont();
+#endif
     if (!reader_scanned_ && !reader_loading_) {
         reader_loading_ = true;
 #ifdef HAN_UI_HOST_SIM
         reader_books_ = han::reader::ScanLibrary("/sdcard/handict/books");
         reader_fonts_ = han::reader::ScanTtfFonts("/sdcard/handict/fonts");
+        reader_book_progress_.assign(reader_books_.size(), 0);
         reader_loading_ = false;
         reader_scanned_ = true;
 #else
@@ -2290,19 +2667,22 @@ void HanDisplay::Reader() {
     }
 
     if (!reader_open_) {
-        auto heading = Label(body_, "TF 卡书架", 24, 10, 500, &han_font_40);
+        auto heading = Label(body_, "TF 卡书架", 24, 10, 500, shelf_title_font);
         lv_obj_set_style_text_color(heading, ThemeText(kInk), 0);
         auto refresh = Button(body_, "重新扫描", 1000, 8, 190, 62, kBlue, 1300);
+        if (auto label = lv_obj_get_child(refresh, 0))
+            lv_obj_set_style_text_font(label, shelf_ui_font, 0);
         lv_obj_set_style_radius(refresh, 20, 0);
         if (reader_loading_) {
-            auto loading = Label(body_, "正在读取 EPUB 元数据…", 0, 210, 1232, &han_font_28);
+            auto loading =
+                Label(body_, "正在读取 EPUB 元数据…", 0, 210, 1232, shelf_title_font);
             lv_obj_set_style_text_align(loading, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_set_style_text_color(loading, ThemeText(kMuted), 0);
             return;
         }
         if (reader_books_.empty()) {
             auto empty = Label(body_, "还没有图书\n请把无 DRM 的 .epub 文件复制到\n/handict/books/",
-                               0, 150, 1232, &han_font_28);
+                               0, 150, 1232, shelf_title_font);
             lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_set_style_text_color(empty, ThemeText(kMuted), 0);
             lv_obj_set_style_text_line_space(empty, 14, 0);
@@ -2316,61 +2696,116 @@ void HanDisplay::Reader() {
             auto card = Button(body_, "", x, y, 388, 218, i % 2 ? kPurple : kGreen,
                                1310 + static_cast<int>(i));
             lv_obj_set_style_radius(card, 24, 0);
-            auto badge = Box(card, 20, 20, 66, 82, book.readable() ? 0xffffff : 0xffdfe3);
-            lv_obj_set_style_radius(badge, 10, 0);
-            auto mark = Label(badge, book.readable() ? "EPUB" : "!", 3, 18, 60, &han_font_28);
-            lv_obj_set_style_text_align(mark, LV_TEXT_ALIGN_CENTER, 0);
-            auto title = Label(card, book.title.c_str(), 104, 18, 258, &han_font_28);
+            auto cover = Box(card, 16, 16, 86, 126, book.readable() ? 0xffffff : 0xffdfe3);
+            lv_obj_set_style_radius(cover, 10, 0);
+            lv_obj_set_style_border_width(cover, 1, 0);
+            lv_obj_set_style_border_color(cover, ThemeBorder(kCardBorder), 0);
+            if (!book.cover_path.empty()) {
+                const std::string cover_source = "S:" + book.cover_path;
+                Image(cover, cover_source.c_str(), 3, 3);
+            } else {
+                auto mark =
+                    Label(cover, book.readable() ? "EPUB" : "!", 3, 45, 80, shelf_ui_font);
+                lv_obj_set_style_text_align(mark, LV_TEXT_ALIGN_CENTER, 0);
+            }
+            auto title = Label(card, book.title.c_str(), 116, 16, 250, shelf_title_font);
+            lv_obj_set_height(title, 70);
             lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_color(title, ThemeText(kInk), 0);
-            const std::string author = book.author.empty() ? "作者未知" : book.author;
-            auto author_label = Label(card, author.c_str(), 104, 72, 258);
-            ApplyDynamicTextFont(author_label);
+            const std::string author = "作者：" + (book.author.empty() ? std::string("未知") : book.author);
+            auto author_label = Label(card, author.c_str(), 116, 94, 250, shelf_ui_font);
+            lv_obj_set_height(author_label, 32);
+            lv_label_set_long_mode(author_label, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_color(author_label, ThemeText(kMuted), 0);
-            const std::string status = book.readable()
-                                           ? std::to_string(book.spine.size()) + " 个章节"
-                                           : "无法打开：" + book.error;
-            auto detail = Label(card, status.c_str(), 22, 142, 344);
-            ApplyDynamicTextFont(detail);
+            const uint16_t progress =
+                i < reader_book_progress_.size() ? reader_book_progress_[i] : 0;
+            const std::string status =
+                book.readable()
+                    ? std::to_string(book.spine.size()) + " 章 · " +
+                          std::to_string(progress / 10) + "%"
+                    : "无法打开：" + book.error;
+            auto detail = Label(card, status.c_str(), 116, 142, 250, shelf_ui_font);
+            lv_obj_set_height(detail, 32);
             lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_color(detail, ThemeText(book.readable() ? kMuted : 0xa32b36), 0);
+            if (book.readable()) {
+                auto progress_track = Box(card, 116, 187, 250, 10, 0xe1d8ca);
+                lv_obj_set_style_radius(progress_track, LV_RADIUS_CIRCLE, 0);
+                lv_obj_set_style_bg_color(progress_track,
+                                          ThemeFill(dark_theme_ ? 0x34465e : 0xe1d8ca), 0);
+                if (progress > 0) {
+                    auto progress_fill = Box(
+                        progress_track, 0, 0,
+                        std::max(4, static_cast<int>(250 * progress / 1000)), 10, 0x4b8f68);
+                    lv_obj_set_style_radius(progress_fill, LV_RADIUS_CIRCLE, 0);
+                    lv_obj_set_style_bg_color(progress_fill,
+                                              lv_color_hex(dark_theme_ ? 0x72c69a : 0x4b8f68), 0);
+                }
+            }
         }
         if (reader_books_.size() > visible) {
-            auto more = Label(body_, "首版书架显示前 6 本；后续加入滚动与搜索", 690, 548, 500);
-            ApplyDynamicTextFont(more);
+            auto more = Label(body_, "首版书架显示前 6 本；后续加入滚动与搜索", 690, 548,
+                              500, shelf_ui_font);
             lv_obj_set_style_text_align(more, LV_TEXT_ALIGN_RIGHT, 0);
             lv_obj_set_style_text_color(more, ThemeText(kMuted), 0);
         }
         return;
     }
 
-    const uint32_t page_background = reader_dark_ ? 0x18202c : 0xfffdf7;
-    const uint32_t page_text = reader_dark_ ? 0xe7edf5 : 0x263247;
-    auto paper = Box(body_, 0, 0, 1232, 592, page_background);
+    const int reader_width = reader_portrait_ ? 720 : 1280;
+    const int reader_height = reader_portrait_ ? 1280 : 720;
+    const uint32_t page_background = reader_dark_ ? 0x101722 : 0xfffdf7;
+    const uint32_t page_text = reader_dark_ ? 0xf3f6fa : 0x263247;
+    const uint32_t chrome_background = reader_dark_ ? 0x202c3d : 0xf4ecdf;
+    const uint32_t chrome_text = reader_dark_ ? 0xf5f7fb : 0x263247;
+    const uint32_t chrome_muted = reader_dark_ ? 0xbec9d8 : 0x61708f;
+    auto paper = Box(body_, 0, 0, reader_width, reader_height, page_background);
     lv_obj_set_style_radius(paper, 0, 0);
+    // Reader day/night colors are independent from the global UI theme. Explicit colors prevent
+    // the shared theme mapper from darkening an already-dark reader palette a second time.
+    lv_obj_set_style_bg_color(paper, lv_color_hex(page_background), 0);
     if (reader_loading_) {
-        auto loading = Label(paper, "正在解压并整理章节…", 0, 250, 1232, &han_font_28);
+        auto loading = Label(paper, "正在解压并整理章节…", 0, reader_height / 2 - 20,
+                             reader_width, shelf_title_font);
         lv_obj_set_style_text_align(loading, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(loading, lv_color_hex(page_text), 0);
         return;
     }
     if (!reader_error_.empty()) {
-        auto error = Label(paper, reader_error_.c_str(), 70, 190, 1092, &han_font_28);
+        auto error = Label(paper, reader_error_.c_str(), 48, reader_height / 2 - 90,
+                           reader_width - 96, shelf_title_font);
         lv_obj_set_style_text_align(error, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(error, lv_color_hex(0xc0434f), 0);
-        Button(paper, "返回书架", 486, 330, 260, 70, kBlue, 1332);
+        auto back = Button(paper, "返回书架", (reader_width - 260) / 2,
+                           reader_height / 2 + 30, 260, 70, kBlue, 1332);
+        if (auto label = lv_obj_get_child(back, 0))
+            lv_obj_set_style_text_font(label, shelf_ui_font, 0);
         return;
     }
 
     EnsureReaderFont();
+#ifndef HAN_UI_HOST_SIM
+    const lv_font_t* reader_control_font =
+        reader_ui_font_ ? reader_ui_font_ : DictionaryTextFont();
+#else
+    const lv_font_t* reader_control_font = DynamicTextFont();
+#endif
     const size_t start =
         reader_page_offsets_.empty() ? 0 : reader_page_offsets_[reader_page_index_];
     const size_t end = reader_page_index_ + 1 < reader_page_offsets_.size()
                            ? reader_page_offsets_[reader_page_index_ + 1]
                            : reader_text_.size();
+#ifndef HAN_UI_HOST_SIM
+    ESP_LOGI("HanDisplay", "Reader position: spine=%u page=%u/%u bytes=%u..%u",
+             static_cast<unsigned>(reader_spine_index_),
+             static_cast<unsigned>(reader_page_index_ + 1),
+             static_cast<unsigned>(reader_page_offsets_.size()), static_cast<unsigned>(start),
+             static_cast<unsigned>(end));
+#endif
     const auto page_text_value = reader_text_.substr(start, end - start);
-    auto text =
-        Label(paper, page_text_value.c_str(), reader_margin_, 18, 1232 - 2 * reader_margin_);
+    auto text = Label(paper, page_text_value.c_str(), reader_margin_, 24,
+                      reader_width - 2 * reader_margin_);
+    lv_obj_set_height(text, reader_height - 48);
 #ifndef HAN_UI_HOST_SIM
     lv_obj_set_style_text_font(text, reader_font_ ? reader_font_ : DictionaryTextFont(), 0);
 #else
@@ -2380,24 +2815,131 @@ void HanDisplay::Reader() {
     lv_obj_set_style_text_line_space(text, reader_line_spacing_, 0);
     lv_label_set_long_mode(text, LV_LABEL_LONG_WRAP);
 
-    auto controls = Box(paper, 0, 500, 1232, 92, reader_dark_ ? 0x222d3d : 0xf4ecdf);
-    lv_obj_set_style_radius(controls, 0, 0);
-    Button(controls, "书架", 18, 14, 110, 62, kBlue, 1332);
-    Button(controls, "‹", 146, 14, 72, 62, kGreen, 1330);
-    Button(controls, "›", 232, 14, 72, 62, kGreen, 1331);
-    Button(controls, "A-", 390, 14, 76, 62, kPurple, 1340);
-    Button(controls, "A+", 478, 14, 76, 62, kPurple, 1341);
-    Button(controls, "行-", 568, 14, 76, 62, kOrange, 1342);
-    Button(controls, "行+", 656, 14, 76, 62, kOrange, 1343);
-    Button(controls, "边距", 744, 14, 104, 62, kBlue, 1344);
-    Button(controls, "字体", 860, 14, 104, 62, kPurple, 1346);
-    Button(controls, reader_dark_ ? "日间" : "夜间", 976, 14, 104, 62, kPink, 1347);
+    const int left_width = reader_width * 32 / 100;
+    const int center_width = reader_width * 36 / 100;
+    const auto tap_zone = [&](int x, int width, int action) {
+        auto zone = Box(paper, x, 0, width, reader_height, page_background);
+        lv_obj_set_style_bg_opa(zone, LV_OPA_TRANSP, 0);
+        lv_obj_add_flag(zone, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_user_data(zone, this);
+        lv_obj_add_event_cb(zone, OnClick, LV_EVENT_CLICKED,
+                            reinterpret_cast<void*>(static_cast<intptr_t>(action)));
+    };
+    tap_zone(0, left_width, 1380);
+    tap_zone(left_width, center_width, 1381);
+    tap_zone(left_width + center_width, reader_width - left_width - center_width, 1382);
+
+    if (!reader_controls_visible_ && !reader_font_picker_open_)
+        return;
+
+    const auto reader_button = [&](lv_obj_t* parent, const char* label, int x, int y, int width,
+                                   int height, int action, bool selected = false) {
+        auto button = Button(parent, label, x, y, width, height, kBlue, action);
+        lv_obj_set_style_bg_color(
+            button,
+            lv_color_hex(selected ? (reader_dark_ ? 0x426b5a : 0xccebd8)
+                                  : (reader_dark_ ? 0x33445b : 0xfffaf0)),
+            0);
+        lv_obj_set_style_border_width(button, 1, 0);
+        lv_obj_set_style_border_color(
+            button, lv_color_hex(reader_dark_ ? 0x566981 : 0xd9cfc0), 0);
+        if (auto label_object = lv_obj_get_child(button, 0)) {
+            lv_obj_set_style_text_font(label_object, reader_control_font, 0);
+            lv_obj_set_style_text_color(label_object, lv_color_hex(chrome_text), 0);
+            lv_label_set_long_mode(label_object, LV_LABEL_LONG_DOT);
+        }
+        return button;
+    };
+
     const std::string progress = std::to_string(reader_page_index_ + 1) + "/" +
                                  std::to_string(std::max<size_t>(1, reader_page_offsets_.size()));
-    auto progress_label = Label(controls, progress.c_str(), 1090, 27, 124);
-    ApplyDynamicTextFont(progress_label);
+    auto top_controls = Box(paper, 0, 0, reader_width, reader_portrait_ ? 88 : 80,
+                            chrome_background);
+    lv_obj_set_style_bg_color(top_controls, lv_color_hex(chrome_background), 0);
+    lv_obj_set_style_bg_opa(top_controls, LV_OPA_90, 0);
+    lv_obj_set_style_radius(top_controls, 0, 0);
+    reader_button(top_controls, "书架", 16, 12, 104, reader_portrait_ ? 64 : 56, 1332);
+    auto book_title = Label(top_controls, reader_book_.title.c_str(), 136, 18,
+                            reader_portrait_ ? 400 : 850, reader_control_font);
+    lv_obj_set_height(book_title, 42);
+    lv_label_set_long_mode(book_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(book_title, lv_color_hex(chrome_text), 0);
+    auto progress_label = Label(top_controls, progress.c_str(), reader_width - 150, 22, 132,
+                                reader_control_font);
     lv_obj_set_style_text_align(progress_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(progress_label, ThemeText(kMuted), 0);
+    lv_obj_set_style_text_color(progress_label, lv_color_hex(chrome_muted), 0);
+
+    const int bottom_height = reader_portrait_ ? 190 : 96;
+    auto controls = Box(paper, 0, reader_height - bottom_height, reader_width, bottom_height,
+                        chrome_background);
+    lv_obj_set_style_bg_color(controls, lv_color_hex(chrome_background), 0);
+    lv_obj_set_style_bg_opa(controls, LV_OPA_90, 0);
+    lv_obj_set_style_radius(controls, 0, 0);
+    const char* labels[] = {"A-", "A+", "行-", "行+", "边距", "字体",
+                            reader_dark_ ? "日间" : "夜间",
+                            reader_portrait_ ? "横屏" : "竖屏"};
+    const int actions[] = {1340, 1341, 1342, 1343, 1344, 1346, 1347, 1345};
+    for (int index = 0; index < 8; ++index) {
+        if (reader_portrait_) {
+            const int column = index % 4;
+            const int row = index / 4;
+            reader_button(controls, labels[index], 24 + column * 168, 16 + row * 82, 144, 66,
+                          actions[index], index == 6 && reader_dark_);
+        } else {
+            reader_button(controls, labels[index], 20 + index * 157, 15, 137, 66,
+                          actions[index], index == 6 && reader_dark_);
+        }
+    }
+
+    if (reader_font_picker_open_) {
+        auto dim = Box(paper, 0, 0, reader_width, reader_height, 0x172033);
+        lv_obj_set_style_bg_opa(dim, LV_OPA_70, 0);
+        lv_obj_add_flag(dim, LV_OBJ_FLAG_CLICKABLE);
+        const int panel_x = reader_portrait_ ? 24 : 80;
+        const int panel_y = reader_portrait_ ? 32 : 40;
+        const int panel_width = reader_width - 2 * panel_x;
+        const int panel_height = reader_height - 2 * panel_y;
+        auto panel = Box(dim, panel_x, panel_y, panel_width, panel_height,
+                         reader_dark_ ? 0x253247 : 0xfffdf7);
+        lv_obj_set_style_bg_color(panel,
+                                  lv_color_hex(reader_dark_ ? 0x253247 : 0xfffdf7), 0);
+        lv_obj_set_style_radius(panel, 24, 0);
+        lv_obj_set_style_border_width(panel, 2, 0);
+        lv_obj_set_style_border_color(panel, lv_color_hex(reader_dark_ ? 0x50647e : 0xe2d7c8), 0);
+        lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+        auto title = Label(panel, "选择阅读字体", 28, 20, panel_width - 210,
+                           reader_control_font);
+        lv_obj_set_style_text_color(title, lv_color_hex(page_text), 0);
+        reader_button(panel, "关闭", panel_width - 148, 14, 120, 58, 1379);
+
+        const size_t choice_count = std::min<size_t>(reader_fonts_.size() + 1, 17);
+        const int columns = reader_portrait_ ? 2 : 3;
+        const int button_width = reader_portrait_ ? 300 : 336;
+        const int column_step = reader_portrait_ ? 316 : 354;
+        const int row_step = reader_portrait_ ? 82 : 68;
+        for (size_t choice = 0; choice < choice_count; ++choice) {
+            const int font_index = static_cast<int>(choice) - 1;
+            const bool selected = reader_font_index_ == font_index;
+            std::string name = choice == 0 ? "内置字体" : ReaderFontDisplayName(reader_fonts_[choice - 1]);
+            if (selected)
+                name = "● " + name;
+            const int column = static_cast<int>(choice % columns);
+            const int row = static_cast<int>(choice / columns);
+            auto button = reader_button(
+                panel, name.c_str(), 24 + column * column_step, 92 + row * row_step,
+                button_width, 62, choice == 0 ? 1360 : 1360 + static_cast<int>(choice),
+                selected);
+            auto label = lv_obj_get_child(button, 0);
+            if (label) {
+                lv_obj_set_width(label, button_width - 24);
+                lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+            }
+        }
+        auto hint = Label(panel, "把 .ttf 文件复制到 /handict/fonts，重新扫描后即可选择",
+                          24, panel_height - 62, panel_width - 48, reader_control_font);
+        lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(reader_dark_ ? 0xb9c7da : kMuted), 0);
+    }
 }
 
 void HanDisplay::ResetFlipAnimation(FlipDigit& digit) {
@@ -5895,16 +6437,24 @@ void HanDisplay::Action(int a) {
             return;
         }
         reader_selected_book_ = index;
+        reader_pages_since_progress_save_ = 0;
         reader_open_ = true;
+        reader_font_picker_open_ = false;
+        reader_controls_visible_ = false;
         reader_loading_ = true;
         reader_error_.clear();
         Render(Page::Reader);
 #ifdef HAN_UI_HOST_SIM
         reader_book_ = reader_books_[index];
-        han::reader::EpubReader::ReadSpineText(reader_book_, 0, reader_text_, reader_error_);
-        reader_spine_index_ = 0;
+        size_t saved_spine = 0;
+        size_t saved_offset = 0;
+        uint16_t saved_progress = 0;
+        LoadReaderProgress(reader_book_.path, saved_spine, saved_offset, saved_progress);
+        han::reader::EpubReader::FindReadableSpineText(
+            reader_book_, std::min(saved_spine, reader_book_.spine.size() - 1), 1,
+            reader_spine_index_, reader_text_, reader_error_);
         reader_loading_ = false;
-        BuildReaderPages();
+        BuildReaderPages(saved_offset);
         Render(Page::Reader);
 #else
         Queue(16, std::to_string(index));
@@ -5912,7 +6462,10 @@ void HanDisplay::Action(int a) {
         return;
     }
     if (a == 1332) {
+        SaveReaderProgress(true);
         reader_open_ = false;
+        reader_font_picker_open_ = false;
+        reader_controls_visible_ = false;
         reader_loading_ = false;
         reader_error_.clear();
         Render(Page::Reader);
@@ -5923,9 +6476,11 @@ void HanDisplay::Action(int a) {
             return;
         if (a == 1330 && reader_page_index_ > 0) {
             --reader_page_index_;
+            SaveReaderProgress(false);
             Render(Page::Reader);
         } else if (a == 1331 && reader_page_index_ + 1 < reader_page_offsets_.size()) {
             ++reader_page_index_;
+            SaveReaderProgress(false);
             Render(Page::Reader);
         } else {
             const bool previous = a == 1330;
@@ -5935,16 +6490,18 @@ void HanDisplay::Action(int a) {
                 return;
             }
             const size_t target = previous ? reader_spine_index_ - 1 : reader_spine_index_ + 1;
+            SaveReaderProgress(true);
             reader_loading_ = true;
             Render(Page::Reader);
 #ifdef HAN_UI_HOST_SIM
-            han::reader::EpubReader::ReadSpineText(reader_book_, target, reader_text_,
-                                                   reader_error_);
-            reader_spine_index_ = target;
+            han::reader::EpubReader::FindReadableSpineText(
+                reader_book_, target, previous ? -1 : 1, reader_spine_index_, reader_text_,
+                reader_error_);
             reader_loading_ = false;
             BuildReaderPages();
             if (previous && !reader_page_offsets_.empty())
                 reader_page_index_ = reader_page_offsets_.size() - 1;
+            SaveReaderProgress(true);
             Render(Page::Reader);
 #else
             Queue(previous ? 18 : 17, std::to_string(target));
@@ -5952,7 +6509,60 @@ void HanDisplay::Action(int a) {
         }
         return;
     }
+    if (a == 1380 || a == 1382) {
+        Action(a == 1380 ? 1330 : 1331);
+        return;
+    }
+    if (a == 1381) {
+        reader_controls_visible_ = !reader_controls_visible_;
+        if (!reader_controls_visible_)
+            reader_font_picker_open_ = false;
+        Render(Page::Reader);
+        return;
+    }
+    if (a == 1346) {
+        reader_controls_visible_ = true;
+        reader_font_picker_open_ = true;
+        Render(Page::Reader);
+        return;
+    }
+    if (a == 1379) {
+        reader_font_picker_open_ = false;
+        Render(Page::Reader);
+        return;
+    }
+    if (a >= 1360 && a <= 1376) {
+        const int selected = a == 1360 ? -1 : a - 1361;
+        if (selected >= static_cast<int>(reader_fonts_.size()))
+            return;
+        reader_font_index_ = selected;
+        reader_font_preference_ = selected >= 0 ? reader_fonts_[selected] : std::string{};
+        reader_font_picker_open_ = false;
+        const size_t offset = reader_page_offsets_.empty()
+                                  ? 0
+                                  : reader_page_offsets_[reader_page_index_];
+        BuildReaderPages(offset);
+        EnsureReaderFont();
+        SaveReaderPreferences();
+        Render(Page::Reader);
+        return;
+    }
+    if (a == 1345) {
+        reader_portrait_ = !reader_portrait_;
+        reader_controls_visible_ = true;
+        reader_font_picker_open_ = false;
+        const size_t offset = reader_page_offsets_.empty()
+                                  ? 0
+                                  : reader_page_offsets_[reader_page_index_];
+        BuildReaderPages(offset);
+        SaveReaderPreferences();
+        Render(Page::Reader);
+        return;
+    }
     if (a >= 1340 && a <= 1347) {
+        const size_t offset = reader_page_offsets_.empty()
+                                  ? 0
+                                  : reader_page_offsets_[reader_page_index_];
         if (a == 1340)
             reader_font_size_ = std::max(22, reader_font_size_ - 2);
         else if (a == 1341)
@@ -5963,14 +6573,9 @@ void HanDisplay::Action(int a) {
             reader_line_spacing_ = std::min(24, reader_line_spacing_ + 2);
         else if (a == 1344)
             reader_margin_ = reader_margin_ >= 72 ? 32 : reader_margin_ + 20;
-        else if (a == 1346)
-            reader_font_index_ =
-                reader_fonts_.empty()
-                    ? -1
-                    : (reader_font_index_ + 2) % (static_cast<int>(reader_fonts_.size()) + 1) - 1;
         else if (a == 1347)
             reader_dark_ = !reader_dark_;
-        BuildReaderPages();
+        BuildReaderPages(offset);
         EnsureReaderFont();
         SaveReaderPreferences();
         Render(Page::Reader);
@@ -6900,7 +7505,9 @@ void HanDisplay::LoadPreferences() {
     reader_line_spacing_ = std::clamp(static_cast<int>(reader.GetInt("line_space", 10)), 2, 24);
     reader_margin_ = std::clamp(static_cast<int>(reader.GetInt("margin", 48)), 32, 72);
     reader_font_index_ = static_cast<int>(reader.GetInt("font", -1));
+    reader_font_preference_ = reader.GetString("font_path");
     reader_dark_ = reader.GetBool("dark", false);
+    reader_portrait_ = reader.GetBool("portrait", false);
     Settings display("display");
     brightness_setting_ = std::clamp(static_cast<int>(display.GetInt("brightness", 75)), 10, 100);
     auto_lock_minutes_ = std::clamp(static_cast<int>(display.GetInt("lock_min", 10)), 1, 30);
@@ -7222,11 +7829,30 @@ void HanDisplay::Worker(void* ptr) {
         } else if (job.type == 15) {
             auto books = han::reader::ScanLibrary("/sdcard/handict/books");
             auto fonts = han::reader::ScanTtfFonts("/sdcard/handict/fonts");
+            std::vector<uint16_t> progress;
+            progress.reserve(books.size());
+            for (const auto& book : books) {
+                size_t spine = 0;
+                size_t offset = 0;
+                uint16_t value = 0;
+                self->LoadReaderProgress(book.path, spine, offset, value);
+                progress.push_back(value);
+            }
             DisplayLockGuard guard(self);
             self->reader_books_ = std::move(books);
             self->reader_fonts_ = std::move(fonts);
-            if (self->reader_font_index_ >= static_cast<int>(self->reader_fonts_.size()))
+            self->reader_book_progress_ = std::move(progress);
+            if (!self->reader_font_preference_.empty()) {
+                const auto selected =
+                    std::find(self->reader_fonts_.begin(), self->reader_fonts_.end(),
+                              self->reader_font_preference_);
+                self->reader_font_index_ =
+                    selected == self->reader_fonts_.end()
+                        ? -1
+                        : static_cast<int>(selected - self->reader_fonts_.begin());
+            } else if (self->reader_font_index_ >= static_cast<int>(self->reader_fonts_.size())) {
                 self->reader_font_index_ = -1;
+            }
             self->reader_loading_ = false;
             self->reader_scanned_ = true;
             if (self->page_ == Page::Reader && !self->reader_open_)
@@ -7244,16 +7870,23 @@ void HanDisplay::Worker(void* ptr) {
             }
             std::string text;
             std::string error;
-            han::reader::EpubReader::ReadSpineText(book, 0, text, error);
+            size_t saved_spine = 0;
+            size_t saved_offset = 0;
+            uint16_t saved_progress = 0;
+            self->LoadReaderProgress(book.path, saved_spine, saved_offset, saved_progress);
+            size_t actual_spine = std::min(saved_spine, book.spine.size() - 1);
+            han::reader::EpubReader::FindReadableSpineText(book, actual_spine, 1, actual_spine,
+                                                           text, error);
             DisplayLockGuard guard(self);
             if (self->reader_selected_book_ != index || !self->reader_open_)
                 continue;
             self->reader_book_ = std::move(book);
             self->reader_text_ = std::move(text);
             self->reader_error_ = std::move(error);
-            self->reader_spine_index_ = 0;
+            self->reader_spine_index_ = actual_spine;
             self->reader_loading_ = false;
-            self->BuildReaderPages();
+            self->BuildReaderPages(saved_offset);
+            self->SaveReaderProgress(false);
             if (self->page_ == Page::Reader)
                 self->Render(Page::Reader);
         } else if (job.type == 17 || job.type == 18) {
@@ -7265,17 +7898,20 @@ void HanDisplay::Worker(void* ptr) {
             }
             std::string text;
             std::string error;
-            han::reader::EpubReader::ReadSpineText(book, spine, text, error);
+            size_t actual_spine = spine;
+            han::reader::EpubReader::FindReadableSpineText(
+                book, spine, job.type == 18 ? -1 : 1, actual_spine, text, error);
             DisplayLockGuard guard(self);
             if (!self->reader_open_)
                 continue;
             self->reader_text_ = std::move(text);
             self->reader_error_ = std::move(error);
-            self->reader_spine_index_ = spine;
+            self->reader_spine_index_ = actual_spine;
             self->reader_loading_ = false;
             self->BuildReaderPages();
             if (job.type == 18 && !self->reader_page_offsets_.empty())
                 self->reader_page_index_ = self->reader_page_offsets_.size() - 1;
+            self->SaveReaderProgress(true);
             if (self->page_ == Page::Reader)
                 self->Render(Page::Reader);
         } else if (job.type == 8) {
