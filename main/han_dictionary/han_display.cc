@@ -11,6 +11,7 @@
 #endif
 #include <wifi_manager.h>
 #include "application.h"
+#include "assets.h"
 #include "assets/lang_config.h"
 #include "audio/audio_codec.h"
 #include "board.h"

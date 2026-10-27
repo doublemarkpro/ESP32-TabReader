@@ -44,6 +44,10 @@ bool DeviceStateMachine::IsValidTransition(DeviceState from, DeviceState to) con
             return to == kDeviceStateStarting;
 
         case kDeviceStateStarting:
+#if CONFIG_BOARD_TYPE_M5STACK_TAB5_READER
+            if (to == kDeviceStateIdle)
+                return true;
+#endif
             // Can go to wifi configuring or activating
             return to == kDeviceStateWifiConfiguring ||
                    to == kDeviceStateActivating;

@@ -1,3 +1,10 @@
+idf_build_get_property(TAB5_READER_BUILD TAB5_READER_BUILD)
+if(TAB5_READER_BUILD)
+    set(BOARD_DIR "m5stack/tab5-reader")
+    include("${CMAKE_CURRENT_LIST_DIR}/reader/reader.cmake")
+    return()
+endif()
+
 # Define source files
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_debugger.cc"
@@ -264,6 +271,8 @@ elseif(CONFIG_BOARD_TYPE_M5STACK_CORE_TAB5)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_30_4)
     set(BUILTIN_ICON_FONT font_material_symbols_30_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+elseif(CONFIG_BOARD_TYPE_M5STACK_TAB5_READER)
+    set(BOARD_DIR "m5stack/tab5-reader")
 elseif(CONFIG_BOARD_TYPE_M5STACK_ATOM_S3_ECHO_BASE)
     set(BOARD_DIR "m5stack/atoms3-echo-base")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)

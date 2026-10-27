@@ -6,7 +6,6 @@
 #include <string>
 #include "application.h"
 #include "assets/lang_config.h"
-#include "audio_codec.h"
 #include "board.h"
 #include "settings.h"
 

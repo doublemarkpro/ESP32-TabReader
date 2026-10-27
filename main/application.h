@@ -1,6 +1,10 @@
 #ifndef _APPLICATION_H_
 #define _APPLICATION_H_
 
+#if CONFIG_BOARD_TYPE_M5STACK_TAB5_READER
+#include "reader/reader_application.h"
+#else
+
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -209,4 +213,5 @@ private:
     BaseType_t original_priority_;
 };
 
+#endif  // CONFIG_BOARD_TYPE_M5STACK_TAB5_READER
 #endif  // _APPLICATION_H_

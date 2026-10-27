@@ -12,7 +12,6 @@
 #include "led/led.h"
 #include "backlight.h"
 #include "camera.h"
-#include "assets.h"
 
 /**
  * Network events for unified callback
