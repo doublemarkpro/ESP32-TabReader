@@ -16,3 +16,7 @@ const result = spawnSync(process.execPath, [converter, '--font',
   '--lv-font-name', 'reader_ui_24', '--output', path.join(root, 'main/reader/assets/reader_ui_24.c')],
   { stdio: 'inherit' });
 process.exitCode = result.status ?? 1;
+if (process.exitCode === 0) {
+  const output = path.join(root, 'main/reader/assets/reader_ui_24.c');
+  fs.writeFileSync(output, fs.readFileSync(output, 'utf8').trimEnd() + '\n');
+}

@@ -132,8 +132,12 @@ struct ReaderUiSimulation {
         display.Render(ReaderDisplay::Page::Transfer);
         Shot(directory + "/transfer-lan-landscape.ppm");
         display.importing_ = display.lan_setup_ = false;
-        display.RequestSleep();
+        display.reader_open_ = true;
+        display.reader_controls_visible_ = display.reader_screen_settings_open_ = true;
+        display.Render(ReaderDisplay::Page::Reader);
+        Click(41);
         Require(display.asleep_, "sleep suspends interaction");
+        Require(Settings("han_reader").GetBool("sleep_resume"), "sleep persists resume marker");
         std::cout << "Dedicated reader UI checks passed\n";
     }
 };

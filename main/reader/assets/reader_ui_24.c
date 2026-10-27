@@ -8559,4 +8559,3 @@ lv_font_t reader_ui_24 = {
 
 
 #endif /*#if READER_UI_24*/
-

@@ -1243,7 +1243,8 @@ void ReaderDisplay::DrawReader() {
                           timeout_y + 48 + index / columns * 68, step - 12, 56, 1410 + index,
                           auto_lock_minutes_ == kReaderScreenTimeouts[index]);
         }
-        setting_label("亮度松手生效，设置自动保存", 28, panel_height - 48, panel_width - 56);
+        setting_label("亮度松手生效，设置自动保存", 28, panel_height - 58, panel_width - 230);
+        reader_button(panel, "立即休眠", panel_width - 180, panel_height - 74, 152, 56, 41);
         UpdateSettingLabels();
     }
 
